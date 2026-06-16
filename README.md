@@ -29,6 +29,9 @@ guardrail layer and an optional AI-assisted universe screener.
   position has a live protective stop, healing the crash/disconnect window where an entry
   filled but its stop was never placed. If a position has already gapped past where its stop
   should sit, it is flattened at market instead; a stop it cannot place is escalated loudly.
+  A held position whose symbol has **dropped out of the current universe** is no longer
+  strategy-managed, so its static stop is replaced with a broker **trailing stop**
+  (`risk.orphan_trailing_stop_pct`, default 5%) that keeps protecting it without being watched.
 
 ## Setup
 
@@ -87,7 +90,9 @@ Operational notes:
 - **Daily cadence.** Decisions land at the next session's open, so "no trades today" is
   expected, not a bug.
 - **Symbols** come from `./universe.json` when present (`TRENDCHIMP_TRADING__UNIVERSE_FILE`);
-  refresh it with `trendchimp screen`.
+  refresh it with `trendchimp screen`. Re-screening daily is fine: a held name that's
+  re-picked stays strategy-managed, while one that drops out is handed off to a trailing
+  stop (above) rather than being left on a static stop.
 
 ## Universe screener
 

@@ -41,7 +41,8 @@ class ManagedOrder:
     filled_avg_price: Decimal | None = None
     filled_qty: Decimal | None = None
     # Stop lifecycle tracking
-    is_stop_order: bool = False        # True for protective stop orders
+    is_stop_order: bool = False        # True for protective stop orders (incl. trailing)
+    is_trailing: bool = False          # True for broker trailing-stop orders
     stop_price: Decimal | None = None  # intended 2N stop price (entries) / actual (stops)
     entry_price: Decimal | None = None
     stop_order_id: str | None = None   # ID of the attached protective stop

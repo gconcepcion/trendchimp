@@ -83,9 +83,18 @@ class TradingBot:
 
         # Guarantee every open position has a live protective stop (heals the
         # crash/disconnect window where an entry filled but its stop was never placed).
-        from trendchimp.runner.recovery import recover_protective_stops
+        from trendchimp.runner.recovery import (
+            convert_orphans_to_trailing_stops,
+            recover_protective_stops,
+        )
         recover_protective_stops(
             order_manager, portfolio, market_data, self._settings,
+            dry_run=self._settings.trading.dry_run,
+        )
+        # Positions whose symbol dropped out of today's universe are no longer
+        # strategy-managed — hand them off to a broker trailing stop.
+        convert_orphans_to_trailing_stops(
+            order_manager, portfolio, set(symbols), self._settings,
             dry_run=self._settings.trading.dry_run,
         )
 

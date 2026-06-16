@@ -170,6 +170,15 @@ class OrderManager:
                 return True
         return False
 
+    def has_trailing_stop(self, symbol: str, required_side: OrderSide, qty: int) -> bool:
+        """True if an open tracked *trailing* stop on `symbol` covers `qty`."""
+        symbol = symbol.upper()
+        for o in self._orders.values():
+            if (o.is_trailing and o.symbol.upper() == symbol and o.is_open()
+                    and o.side == required_side and o.qty >= Decimal(str(qty))):
+                return True
+        return False
+
     def place_protective_stop(
         self, symbol: str, side: OrderSide, qty: int, stop_price: Decimal,
     ) -> ManagedOrder | None:
@@ -208,6 +217,52 @@ class OrderManager:
         logger.info("Recovered protective stop (%s) for %s @ %s [%s]",
                     side.value, symbol, stop_price, managed.order_id)
         return managed
+
+    def place_trailing_stop(
+        self, symbol: str, side: OrderSide, qty: int, trail_percent: float,
+    ) -> ManagedOrder | None:
+        """Place a GTC trailing stop for an existing position (orphan hand-off).
+
+        `trail_percent` is a whole-number percent (5.0 == 5%). Used when a held
+        symbol drops out of the traded universe: the broker trails the stop without
+        the bot watching the symbol."""
+        if self._dry_run:
+            logger.info("[DRY RUN] would place %s %.2f%% trailing stop %d %s",
+                        side.value, trail_percent, qty, symbol)
+            return None
+
+        from alpaca.trading.enums import OrderSide as AlpacaSide, TimeInForce
+        from alpaca.trading.requests import TrailingStopOrderRequest
+
+        alpaca_side = AlpacaSide.SELL if side == OrderSide.SELL else AlpacaSide.BUY
+        request = TrailingStopOrderRequest(
+            symbol=symbol, qty=qty, side=alpaca_side,
+            trail_percent=trail_percent, time_in_force=TimeInForce.GTC,
+        )
+        try:
+            raw = self._client.submit_order(request)
+        except Exception:
+            logger.exception("Failed to place trailing stop for %s", symbol)
+            return None
+
+        managed = ManagedOrder(
+            order_id=str(raw.id), symbol=symbol.upper(), side=side,
+            qty=Decimal(str(qty)), status=_enum_str(raw.status),
+            submitted_at=datetime.now(tz=timezone.utc), strategy_name="",
+            is_stop_order=True, is_trailing=True, raw=raw,
+        )
+        self._orders[managed.order_id] = managed
+        audit.info("TRAILING_STOP_PLACED", extra={
+            "order_id": managed.order_id, "symbol": symbol.upper(),
+            "side": side.value, "qty": str(qty), "trail_percent": str(trail_percent),
+        })
+        logger.info("Trailing stop (%s, %.2f%%) placed for %s [%s]",
+                    side.value, trail_percent, symbol, managed.order_id)
+        return managed
+
+    def cancel_open_stops(self, symbol: str) -> None:
+        """Public wrapper: cancel any still-open protective/trailing stop for a symbol."""
+        self._cancel_open_stops(symbol)
 
     def flatten_now(self, symbol: str, side: OrderSide, qty: int) -> ManagedOrder | None:
         """Market-exit a position whose protective stop is already breached."""
@@ -323,6 +378,7 @@ class OrderManager:
         side = OrderSide.BUY if raw_side == "buy" else OrderSide.SELL
         order_type = _enum_str(getattr(order, "type", ""))
         is_stop = "stop" in order_type  # "stop" / "stop_limit" / "trailing_stop"
+        is_trailing = "trailing" in order_type
         stop_raw = getattr(order, "stop_price", None)
         return ManagedOrder(
             order_id=str(order.id),
@@ -333,6 +389,7 @@ class OrderManager:
             submitted_at=getattr(order, "submitted_at", datetime.now(tz=timezone.utc)),
             strategy_name="",
             is_stop_order=is_stop,
+            is_trailing=is_trailing,
             stop_price=Decimal(str(stop_raw)) if stop_raw is not None else None,
             raw=order,
         )

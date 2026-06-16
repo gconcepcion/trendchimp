@@ -100,6 +100,63 @@ def recover_protective_stops(
         recovered, flattened, protected, failed)
 
 
+def convert_orphans_to_trailing_stops(
+    order_manager: "OrderManager",
+    portfolio: "PortfolioState",
+    universe_symbols: set[str],
+    settings: "TrendChimpSettings",
+    dry_run: bool = False,
+) -> None:
+    """Hand off positions whose symbol has dropped out of the traded universe.
+
+    Such a position is no longer watched by the strategy, so its Donchian exit can
+    never fire. Replace its static protective stop with a broker GTC trailing stop
+    so it keeps protecting/ratcheting without being watched. Idempotent: a position
+    already on a trailing stop is left alone.
+    """
+    positions = portfolio.get_all_positions()
+    universe = {s.upper() for s in universe_symbols}
+    trail_pct = float(settings.risk.orphan_trailing_stop_pct) * 100.0
+    if trail_pct <= 0:
+        return
+
+    converted = failed = 0
+    for pos in positions:
+        symbol = pos.symbol.upper()
+        if symbol in universe:
+            continue  # still strategy-managed
+        qty = int(abs(pos.qty))
+        if qty < 1:
+            continue
+        stop_side = OrderSide.SELL if pos.qty > 0 else OrderSide.BUY
+
+        if order_manager.has_trailing_stop(symbol, stop_side, qty):
+            continue  # already handed off on a prior restart
+
+        logger.info("Converting orphan %s (left the universe) to a %.1f%% trailing stop",
+                    symbol, trail_pct)
+        # Drop the static stop first so the position isn't double-stopped; the window
+        # is sub-second and this runs at startup before the stream connects.
+        order_manager.cancel_open_stops(symbol)
+
+        if order_manager.place_trailing_stop(symbol, stop_side, qty, trail_pct) is not None or dry_run:
+            converted += 1
+        else:
+            failed += 1
+            audit.error("ORPHAN_TRAIL_FAILED", extra={
+                "symbol": symbol, "side": stop_side.value, "qty": str(qty),
+            })
+            logger.critical(
+                "Orphan trailing-stop FAILED for %s — its static stop was cancelled and the "
+                "position is now UNPROTECTED (%d shares). Place a stop manually.", symbol, qty,
+            )
+
+    if converted or failed:
+        log = logger.error if failed else logger.info
+        log("Orphan hand-off complete: %d converted to trailing stops, %d FAILED",
+            converted, failed)
+
+
 def _atr_and_last_close(
     market_data: "MarketDataClient", symbol: str, settings: "TrendChimpSettings",
 ) -> tuple[float | None, Decimal | None]:

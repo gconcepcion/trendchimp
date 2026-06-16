@@ -9,22 +9,38 @@ from alpaca.trading.requests import MarketOrderRequest, StopOrderRequest
 from tests.conftest import make_bar_sequence, make_position
 from trendchimp.config.settings import RiskSettings, TrendChimpSettings, AlpacaSettings
 from trendchimp.orders.manager import OrderManager
-from trendchimp.runner.recovery import recover_protective_stops
+from trendchimp.runner.recovery import (
+    convert_orphans_to_trailing_stops,
+    recover_protective_stops,
+)
 from trendchimp.signals.models import OrderSide
 
 
 # ----------------------------------------------------------- routine-level tests
 class _FakeOM:
-    def __init__(self, has_stop=False):
+    def __init__(self, has_stop=False, has_trailing=False):
         self._has = has_stop
+        self._has_trailing = has_trailing
         self.placed: list = []
         self.flattened: list = []
+        self.trailed: list = []
+        self.cancelled: list = []
 
     def has_protective_stop(self, symbol, side, qty):
         return self._has
 
+    def has_trailing_stop(self, symbol, side, qty):
+        return self._has_trailing
+
     def place_protective_stop(self, symbol, side, qty, stop_price):
         self.placed.append((symbol, side, qty, stop_price))
+        return object()
+
+    def cancel_open_stops(self, symbol):
+        self.cancelled.append(symbol)
+
+    def place_trailing_stop(self, symbol, side, qty, trail_percent):
+        self.trailed.append((symbol, side, qty, trail_percent))
         return object()
 
     def flatten_now(self, symbol, side, qty):
@@ -134,6 +150,38 @@ def test_failed_stop_submission_is_escalated(caplog):
     assert any("unprotected" in r.message.lower() for r in caplog.records)
 
 
+# ----------------------------------------------------------- orphan trailing-stop
+def _run_orphans(positions, universe, has_trailing=False, dry_run=False):
+    om = _FakeOM(has_trailing=has_trailing)
+    convert_orphans_to_trailing_stops(
+        om, _FakePortfolio(positions), set(universe), _settings(), dry_run=dry_run)
+    return om
+
+
+def test_orphan_dropped_from_universe_gets_trailing_stop():
+    # AAPL is held but no longer in the universe -> cancel its static stop and place
+    # a 5% trailing stop (default orphan_trailing_stop_pct).
+    om = _run_orphans([make_position(symbol="AAPL", qty="10", avg="100")], universe=["MSFT"])
+    assert om.cancelled == ["AAPL"]
+    assert om.trailed == [("AAPL", OrderSide.SELL, 10, 5.0)]
+
+
+def test_short_orphan_gets_buy_trailing_stop():
+    om = _run_orphans([make_position(symbol="AAPL", qty="-10", avg="100")], universe=["MSFT"])
+    assert om.trailed == [("AAPL", OrderSide.BUY, 10, 5.0)]
+
+
+def test_position_still_in_universe_is_untouched():
+    om = _run_orphans([make_position(symbol="AAPL", qty="10", avg="100")], universe=["AAPL"])
+    assert om.trailed == [] and om.cancelled == []
+
+
+def test_orphan_already_trailing_is_skipped():
+    om = _run_orphans([make_position(symbol="AAPL", qty="10", avg="100")],
+                      universe=["MSFT"], has_trailing=True)
+    assert om.trailed == [] and om.cancelled == []
+
+
 # --------------------------------------------------------- OrderManager-level tests
 def _alpaca_stop(symbol="AAPL", side="sell", qty="10", stop_price="96", oid="s1"):
     o = MagicMock()
@@ -166,6 +214,18 @@ def test_place_protective_stop_submits_gtc(mock_trading_client, portfolio_state)
     assert om.has_protective_stop("AAPL", OrderSide.SELL, 10) is True
 
 
+def test_place_trailing_stop_submits_gtc(mock_trading_client, portfolio_state):
+    from alpaca.trading.requests import TrailingStopOrderRequest
+
+    om = OrderManager(mock_trading_client, portfolio_state, dry_run=False)
+    om.place_trailing_stop("AAPL", OrderSide.SELL, 10, 5.0)
+    req = mock_trading_client.submit_order.call_args.args[0]
+    assert isinstance(req, TrailingStopOrderRequest)
+    assert req.side == AlpacaSide.SELL and req.trail_percent == 5.0 and req.qty == 10
+    # Tracked as a trailing stop, so a later restart sees it and skips re-converting.
+    assert om.has_trailing_stop("AAPL", OrderSide.SELL, 10) is True
+
+
 def test_flatten_now_submits_market(mock_trading_client, portfolio_state):
     om = OrderManager(mock_trading_client, portfolio_state, dry_run=False)
     om.flatten_now("AAPL", OrderSide.SELL, 10)
@@ -177,5 +237,6 @@ def test_flatten_now_submits_market(mock_trading_client, portfolio_state):
 def test_dry_run_places_nothing(mock_trading_client, portfolio_state):
     om = OrderManager(mock_trading_client, portfolio_state, dry_run=True)
     assert om.place_protective_stop("AAPL", OrderSide.SELL, 10, Decimal("96")) is None
+    assert om.place_trailing_stop("AAPL", OrderSide.SELL, 10, 5.0) is None
     assert om.flatten_now("AAPL", OrderSide.SELL, 10) is None
     mock_trading_client.submit_order.assert_not_called()
