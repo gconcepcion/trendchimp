@@ -137,6 +137,22 @@ Point the bot at the file with `TRENDCHIMP_TRADING__UNIVERSE_FILE`. When set and
 to the hand-configured list. The AI step needs `TRENDCHIMP_SCREENER__ANTHROPIC_API_KEY`
 (model defaults to `claude-opus-4-8`); `--no-ai` skips it and writes the top technical picks.
 
+### Small accounts: price-filtered universe
+
+Sizing is whole-share with a 1% risk budget and a 20% per-position cap, so a **$1–2K**
+account rounds most S&P names to **0 shares** (it can't afford a share of a $300+ stock
+within the cap). Screen a cheaper universe so it can actually take positions:
+
+```bash
+trendchimp screen --max-price 50 --min-price 5 --output universe.json
+```
+
+`--min-price`/`--max-price` (or `TRENDCHIMP_SCREENER__MIN_PRICE`/`MAX_PRICE`) default to
+`0` = no limit, so the standard run is unchanged. For a small live account also bump
+`RISK_PER_TRADE_PCT`/`MAX_POSITION_PCT` and disable shorting — see the commented
+**small-account preset** in `.env.example`. (At $10–20K the defaults are fine; leave the
+price band at 0.)
+
 ## Tests
 
 ```bash

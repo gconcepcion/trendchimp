@@ -62,6 +62,11 @@ class ScreenerSettings(BaseSettings):
     final_picks: int = 10            # tickers Claude selects for the universe
     lookback_days: int = 260         # daily bars fetched per symbol (SMA200 + buffer)
     cache_dir: str = "./cache"       # where the S&P 500 list is cached
+    # Price band for candidates (0 = no limit). Set max_price for small accounts so
+    # whole-share sizing can still take positions (a $1-2K account can't afford a
+    # share of a $300+ stock within the 20% position cap).
+    min_price: float = 0.0
+    max_price: float = 0.0
 
 
 class LoggingSettings(BaseSettings):

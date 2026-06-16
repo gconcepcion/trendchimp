@@ -68,3 +68,28 @@ def test_top_n_limit():
     frames = {f"S{i}": _df(_uptrend(start=50 + i)) for i in range(5)}
     out = TrendScorer().score_all(list(frames), _FakeMarketData(frames), top_n=3)
     assert len(out) == 3
+
+
+def _price_frames():
+    # CHEAP ends near $36 (start 10 -> *3.6), PRICEY near $364 (start 100).
+    return {"CHEAP": _df(_uptrend(start=10.0)), "PRICEY": _df(_uptrend(start=100.0))}
+
+
+def test_max_price_filters_out_expensive_names():
+    frames = _price_frames()
+    out = TrendScorer().score_all(list(frames), _FakeMarketData(frames), top_n=10, max_price=50.0)
+    symbols = {c.symbol for c in out}
+    assert "CHEAP" in symbols and "PRICEY" not in symbols  # PRICEY (~$364) dropped
+
+
+def test_min_price_filters_out_cheap_names():
+    frames = _price_frames()
+    out = TrendScorer().score_all(list(frames), _FakeMarketData(frames), top_n=10, min_price=50.0)
+    symbols = {c.symbol for c in out}
+    assert "PRICEY" in symbols and "CHEAP" not in symbols  # CHEAP (~$36) dropped
+
+
+def test_zero_price_band_is_no_op():
+    frames = _price_frames()
+    out = TrendScorer().score_all(list(frames), _FakeMarketData(frames), top_n=10)  # defaults 0/0
+    assert {c.symbol for c in out} == {"CHEAP", "PRICEY"}  # default behavior unchanged
