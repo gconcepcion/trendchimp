@@ -53,6 +53,42 @@ TRENDCHIMP_TRADING__DRY_RUN=true trendchimp run
 Live trading requires a deliberate double-lock: both `TRENDCHIMP_ALPACA__PAPER=false`
 and `TRENDCHIMP_LIVE_TRADING_CONFIRMED=true`.
 
+## Running it day-to-day (manual)
+
+There is no service/scheduler — the bot is launched by hand each session. It reads
+`./.env` (paper keys, `PAPER=true`) and runs in the foreground.
+
+```bash
+cd /home/gconcepcion/sandbox/trendchimp
+source venv/bin/activate
+trendchimp status        # optional pre-flight: account summary (read-only)
+trendchimp positions     # optional pre-flight: open positions (read-only)
+trendchimp run           # start the bot (loads ./.env; override with --env-file)
+```
+
+To also keep a console log on disk, tee stdout (the app itself only writes the audit
+JSONL at `logs/trades.jsonl`, not the console file):
+
+```bash
+trendchimp run 2>&1 | tee -a logs/bot.console.log
+```
+
+**Stop** with Ctrl-C (SIGINT). The bot traps SIGINT/SIGTERM and closes the websocket
+cleanly — important because of the single-connection limit below.
+
+Operational notes:
+
+- **One data connection only.** Never run two instances. If you see `connection limit
+  exceeded`, kill every instance and wait ~2–5 min for Alpaca to drop the stale socket
+  before restarting.
+- **Stops self-heal on start.** Startup recovery places a protective stop for any open
+  position missing one — so just starting the bot protects naked positions (watch for
+  `STOP_RECOVERED` in `logs/trades.jsonl`).
+- **Daily cadence.** Decisions land at the next session's open, so "no trades today" is
+  expected, not a bug.
+- **Symbols** come from `./universe.json` when present (`TRENDCHIMP_TRADING__UNIVERSE_FILE`);
+  refresh it with `trendchimp screen`.
+
 ## Universe screener
 
 `trendchimp screen` builds the list of symbols the bot trades. It pulls the S&P 500
