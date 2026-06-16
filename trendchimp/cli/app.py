@@ -4,6 +4,7 @@ import click
 
 from trendchimp.cli.commands.positions import positions
 from trendchimp.cli.commands.run import run
+from trendchimp.cli.commands.screen import screen
 from trendchimp.cli.commands.status import status
 
 
@@ -16,6 +17,7 @@ def cli() -> None:
 cli.add_command(run)
 cli.add_command(status)
 cli.add_command(positions)
+cli.add_command(screen)
 
 
 if __name__ == "__main__":

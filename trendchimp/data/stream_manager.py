@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
@@ -24,11 +25,17 @@ class StreamManager:
         settings: "TrendChimpSettings",
         stock_stream: Any | None = None,
         trading_stream: Any | None = None,
+        symbols: list[str] | None = None,
     ) -> None:
         self._feed = feed
         self._settings = settings
         self._stock_stream = stock_stream
         self._trading_stream = trading_stream
+        # Subscribe to the symbols actually being traded (the resolved universe),
+        # NOT the raw configured list — otherwise the stream watches the wrong
+        # tickers and no bars ever reach the strategy handlers.
+        source = symbols if symbols is not None else settings.trading.symbols
+        self._symbols = [s.upper() for s in source]
         self._trade_update_handlers: list[TradeUpdateHandler] = []
         self._tasks: list[asyncio.Task] = []
 
@@ -36,7 +43,7 @@ class StreamManager:
         self._trade_update_handlers.append(handler)
 
     async def start(self) -> None:
-        symbols = [s.upper() for s in self._settings.trading.symbols]
+        symbols = self._symbols
 
         if self._stock_stream:
             self._stock_stream.subscribe_bars(self._on_bar, *symbols)
@@ -49,10 +56,38 @@ class StreamManager:
             logger.info("Trading stream started")
 
     async def stop(self) -> None:
-        for task in self._tasks:
-            task.cancel()
+        # Gracefully close each websocket. Alpaca's _consume loop watches the
+        # stop queue and sends a close frame (via stream.close()) before the
+        # run loop exits. Cancelling the task instead would kill the coroutine
+        # mid-recv without ever closing the socket, so Alpaca keeps the old
+        # connection alive server-side and rejects the next start with
+        # "connection limit exceeded" (only one data connection is allowed).
+        for stream in (self._stock_stream, self._trading_stream):
+            if stream is None:
+                continue
+            # alpaca-py exposes async stop_ws(); tolerate a sync stop_ws/stop or a
+            # missing one (test doubles) so a bad close path can't leave the socket
+            # open server-side — the tasks are still cancelled as a backstop below.
+            stop = getattr(stream, "stop_ws", None) or getattr(stream, "stop", None)
+            if stop is None:
+                logger.warning("Stream %s has no stop_ws()/stop() — relying on task cancel",
+                               type(stream).__name__)
+                continue
+            try:
+                result = stop()
+                if inspect.isawaitable(result):
+                    await result
+            except Exception:
+                logger.exception("Error signaling stream to stop")
+
         if self._tasks:
-            await asyncio.gather(*self._tasks, return_exceptions=True)
+            # Give the run loops time to notice the stop signal and close
+            # cleanly; only cancel as a last resort if they hang.
+            _, pending = await asyncio.wait(self._tasks, timeout=10)
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
         self._tasks.clear()
         logger.info("All streams stopped")
 

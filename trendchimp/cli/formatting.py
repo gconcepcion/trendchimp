@@ -17,6 +17,20 @@ def render_account(account) -> None:
     console.print(table)
 
 
+def render_picks(picks, output_path: str) -> None:
+    if not picks:
+        console.print("[dim]No picks selected.[/dim]")
+        return
+    table = Table(title=f"Selected universe → {output_path}")
+    for col in ("Symbol", "Conviction", "Rationale"):
+        table.add_column(col)
+    for p in picks:
+        stars = "★" * p.conviction + "☆" * (5 - p.conviction)
+        table.add_row(p.symbol, stars, p.rationale)
+    console.print(table)
+    console.print(f"[green]{len(picks)} symbols written to {output_path}[/green]")
+
+
 def render_positions(positions) -> None:
     if not positions:
         console.print("[dim]No open positions.[/dim]")

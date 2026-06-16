@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import signal
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING
@@ -77,20 +78,48 @@ class TradingBot:
         )
         logger.info("Strategy: %s with params %s", strategy.name, strategy.parameters)
 
-        symbols = [s.upper() for s in self._settings.trading.symbols]
+        symbols = self._resolve_symbols()
         await self._warmup(strategy, market_data, portfolio, symbols)
+
+        # Guarantee every open position has a live protective stop (heals the
+        # crash/disconnect window where an entry filled but its stop was never placed).
+        from trendchimp.runner.recovery import (
+            convert_orphans_to_trailing_stops,
+            recover_protective_stops,
+        )
+        recover_protective_stops(
+            order_manager, portfolio, market_data, self._settings,
+            dry_run=self._settings.trading.dry_run,
+        )
+        # Positions whose symbol dropped out of today's universe are no longer
+        # strategy-managed — hand them off to a broker trailing stop.
+        convert_orphans_to_trailing_stops(
+            order_manager, portfolio, set(symbols), market_data, self._settings,
+            dry_run=self._settings.trading.dry_run,
+        )
 
         feed = MarketDataFeed()
         stop_event = asyncio.Event()
 
+        # The live websocket only emits 1-minute bars; roll them up into daily
+        # bars so the Turtle strategy runs once per completed session.
+        from trendchimp.data.aggregator import DailyBarAggregator
+        aggregator = DailyBarAggregator()
+
         async def _on_bar(bar):
+            # Every intraday bar refreshes the mark so the kill-switch and
+            # protective stops see live prices; the strategy itself only acts on
+            # completed daily bars emitted by the aggregator.
             portfolio.update_mark(bar.symbol, bar.close)
             if killswitch.check(portfolio):
                 logger.error("Kill-switch tripped (%s) — initiating shutdown",
                              killswitch.reason)
                 stop_event.set()
                 return
-            for sig in await strategy.on_bar(bar):
+            daily = aggregator.add(bar)
+            if daily is None:
+                return
+            for sig in await strategy.on_bar(daily):
                 decision = risk_manager.evaluate(sig, portfolio)
                 if decision:
                     order_manager.submit(decision)
@@ -101,6 +130,7 @@ class TradingBot:
         stream_manager = StreamManager(
             feed=feed, settings=self._settings,
             stock_stream=stock_stream, trading_stream=trading_stream,
+            symbols=symbols,
         )
         stream_manager.add_trade_update_handler(order_manager.handle_trade_update)
 
@@ -128,6 +158,28 @@ class TradingBot:
             self._running = False
             logger.info("trendchimp stopped")
 
+    def _resolve_symbols(self) -> list[str]:
+        """Trade the AI-screened universe file if configured and present; else the
+        hand-configured symbol list."""
+        universe_file = self._settings.trading.universe_file
+        if universe_file and os.path.exists(universe_file):
+            try:
+                from trendchimp.screener.writer import load_universe_symbols
+
+                symbols = load_universe_symbols(universe_file)
+                if symbols:
+                    logger.info("Loaded %d symbols from universe file %s",
+                                len(symbols), universe_file)
+                    return symbols
+                logger.warning("Universe file %s has no symbols — using configured symbols",
+                               universe_file)
+            except Exception:
+                logger.exception("Failed to read universe file %s — using configured symbols",
+                                 universe_file)
+        elif universe_file:
+            logger.warning("Universe file %s not found — using configured symbols", universe_file)
+        return [s.upper() for s in self._settings.trading.symbols]
+
     async def _warmup(self, strategy, market_data, portfolio, symbols) -> None:
         """Replay recent history through the strategy to prime channels/ATR, and
         seed directional state from any existing position so a restart doesn't
@@ -138,17 +190,26 @@ class TradingBot:
         # Generous lookback: daily bars need calendar days >> trading days.
         end = datetime.now(tz=timezone.utc)
         start = end - timedelta(days=needed * 3 + 30)
-        for symbol in symbols:
-            try:
-                bars = market_data.get_bars(symbol, self._settings.trading.timeframe, start, end)
-            except Exception:
-                logger.exception("Warmup fetch failed for %s — continuing", symbol)
-                continue
-            for bar in bars[:-1] if bars else []:
-                # Prime indicators without acting on signals.
-                await strategy.on_bar(bar)
-            position = portfolio.get_position(symbol)
-            strategy.seed_position(symbol, float(position.qty) if position else 0.0)
-            logger.info("Warmed up %s with %d bars (pos=%s)",
-                        symbol, max(0, len(bars) - 1) if bars else 0,
-                        position.qty if position else 0)
+        # Replaying history fires the strategy's per-signal INFO logs even though
+        # we discard the signals here; mute them so warmup doesn't look like a
+        # flurry of real trades.
+        strat_logger = logging.getLogger("trendchimp.strategies")
+        prev_level = strat_logger.level
+        strat_logger.setLevel(logging.WARNING)
+        try:
+            for symbol in symbols:
+                try:
+                    bars = market_data.get_bars(symbol, self._settings.trading.timeframe, start, end)
+                except Exception:
+                    logger.exception("Warmup fetch failed for %s — continuing", symbol)
+                    continue
+                for bar in bars[:-1] if bars else []:
+                    # Prime indicators without acting on signals.
+                    await strategy.on_bar(bar)
+                position = portfolio.get_position(symbol)
+                strategy.seed_position(symbol, float(position.qty) if position else 0.0)
+                logger.info("Warmed up %s with %d bars (pos=%s)",
+                            symbol, max(0, len(bars) - 1) if bars else 0,
+                            position.qty if position else 0)
+        finally:
+            strat_logger.setLevel(prev_level)

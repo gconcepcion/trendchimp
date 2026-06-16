@@ -6,6 +6,14 @@ from decimal import Decimal
 logger = logging.getLogger(__name__)
 
 
+def protective_stop_price(entry_price: Decimal, distance: Decimal, is_long: bool) -> Decimal:
+    """Stop price `distance` away from entry, on the protective side: below a long,
+    above a short. Shared by entry sizing and startup stop-recovery so a recovered
+    stop sits exactly where the strategy would have placed it."""
+    raw = entry_price - distance if is_long else entry_price + distance
+    return raw.quantize(Decimal("0.01"))
+
+
 class TurtleUnitSizer:
     """ATR/N-unit position sizing (Turtle "Unit" formula).
 

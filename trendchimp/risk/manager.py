@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING
 
 from trendchimp.orders.models import OrderDecision
 from trendchimp.signals.models import OrderSide, Signal, TradeIntent
-from trendchimp.risk.sizing import TurtleUnitSizer
+from trendchimp.risk.sizing import TurtleUnitSizer, protective_stop_price
 
 if TYPE_CHECKING:
     from trendchimp.config.settings import RiskSettings
@@ -111,9 +111,7 @@ class RiskManager:
 
     def _fallback_stop(self, intent: TradeIntent, entry_price: Decimal, n: Decimal) -> Decimal:
         distance = Decimal(str(self._settings.atr_stop_mult)) * n
-        if intent == TradeIntent.ENTER_LONG:
-            return (entry_price - distance).quantize(Decimal("0.01"))
-        return (entry_price + distance).quantize(Decimal("0.01"))
+        return protective_stop_price(entry_price, distance, intent == TradeIntent.ENTER_LONG)
 
     @staticmethod
     def _as_decimal(value) -> Decimal | None:

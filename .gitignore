@@ -9,3 +9,8 @@ htmlcov/
 logs/
 build/
 dist/
+
+# Runtime artifacts written by the bot / screener
+cache/
+universe.json
+universe.json.*
