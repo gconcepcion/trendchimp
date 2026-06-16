@@ -46,8 +46,10 @@ class RiskSettings(BaseSettings):
     allow_short: bool = True
     # Startup stop-recovery: stop distance used only when ATR can't be computed.
     recovery_fallback_stop_pct: float = 0.10
-    # A held position whose symbol drops out of the traded universe is handed off to
-    # a broker GTC trailing stop at this percent below/above the running price.
+    # A held position whose symbol drops out of the traded universe is handed off to a
+    # broker GTC trailing stop. The trail distance is atr_mult × N (ATR); the percent
+    # below is only a fallback for when ATR can't be computed (too little history).
+    orphan_trailing_atr_mult: float = 2.0
     orphan_trailing_stop_pct: float = 0.05
 
 

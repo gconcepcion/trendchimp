@@ -94,7 +94,7 @@ class TradingBot:
         # Positions whose symbol dropped out of today's universe are no longer
         # strategy-managed — hand them off to a broker trailing stop.
         convert_orphans_to_trailing_stops(
-            order_manager, portfolio, set(symbols), self._settings,
+            order_manager, portfolio, set(symbols), market_data, self._settings,
             dry_run=self._settings.trading.dry_run,
         )
 

@@ -219,25 +219,35 @@ class OrderManager:
         return managed
 
     def place_trailing_stop(
-        self, symbol: str, side: OrderSide, qty: int, trail_percent: float,
+        self, symbol: str, side: OrderSide, qty: int,
+        *, trail_percent: float | None = None, trail_price: Decimal | None = None,
     ) -> ManagedOrder | None:
         """Place a GTC trailing stop for an existing position (orphan hand-off).
 
-        `trail_percent` is a whole-number percent (5.0 == 5%). Used when a held
-        symbol drops out of the traded universe: the broker trails the stop without
-        the bot watching the symbol."""
+        Pass exactly one of `trail_price` (absolute dollar distance, e.g. 2N) or
+        `trail_percent` (whole-number percent, 5.0 == 5%). Used when a held symbol
+        drops out of the traded universe: the broker trails the stop without the bot
+        watching the symbol."""
+        if (trail_price is None) == (trail_percent is None):
+            raise ValueError("pass exactly one of trail_price or trail_percent")
+        if trail_price is not None:
+            trail_price = trail_price.quantize(Decimal("0.01"))
+        trail_desc = f"${trail_price}" if trail_price is not None else f"{trail_percent:.2f}%"
+
         if self._dry_run:
-            logger.info("[DRY RUN] would place %s %.2f%% trailing stop %d %s",
-                        side.value, trail_percent, qty, symbol)
+            logger.info("[DRY RUN] would place %s trailing stop (%s) %d %s",
+                        side.value, trail_desc, qty, symbol)
             return None
 
         from alpaca.trading.enums import OrderSide as AlpacaSide, TimeInForce
         from alpaca.trading.requests import TrailingStopOrderRequest
 
         alpaca_side = AlpacaSide.SELL if side == OrderSide.SELL else AlpacaSide.BUY
+        trail_kw = ({"trail_price": float(trail_price)} if trail_price is not None
+                    else {"trail_percent": float(trail_percent)})
         request = TrailingStopOrderRequest(
             symbol=symbol, qty=qty, side=alpaca_side,
-            trail_percent=trail_percent, time_in_force=TimeInForce.GTC,
+            time_in_force=TimeInForce.GTC, **trail_kw,
         )
         try:
             raw = self._client.submit_order(request)
@@ -254,10 +264,11 @@ class OrderManager:
         self._orders[managed.order_id] = managed
         audit.info("TRAILING_STOP_PLACED", extra={
             "order_id": managed.order_id, "symbol": symbol.upper(),
-            "side": side.value, "qty": str(qty), "trail_percent": str(trail_percent),
+            "side": side.value, "qty": str(qty),
+            **{k: str(v) for k, v in trail_kw.items()},
         })
-        logger.info("Trailing stop (%s, %.2f%%) placed for %s [%s]",
-                    side.value, trail_percent, symbol, managed.order_id)
+        logger.info("Trailing stop (%s, %s) placed for %s [%s]",
+                    side.value, trail_desc, symbol, managed.order_id)
         return managed
 
     def cancel_open_stops(self, symbol: str) -> None:

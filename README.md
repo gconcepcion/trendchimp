@@ -30,8 +30,9 @@ guardrail layer and an optional AI-assisted universe screener.
   filled but its stop was never placed. If a position has already gapped past where its stop
   should sit, it is flattened at market instead; a stop it cannot place is escalated loudly.
   A held position whose symbol has **dropped out of the current universe** is no longer
-  strategy-managed, so its static stop is replaced with a broker **trailing stop**
-  (`risk.orphan_trailing_stop_pct`, default 5%) that keeps protecting it without being watched.
+  strategy-managed, so its static stop is replaced with a broker **trailing stop** that
+  trails `risk.orphan_trailing_atr_mult × N` (ATR; default 2N), falling back to a flat
+  percent (`risk.orphan_trailing_stop_pct`) only when ATR can't be computed.
 
 ## Setup
 

@@ -39,8 +39,8 @@ class _FakeOM:
     def cancel_open_stops(self, symbol):
         self.cancelled.append(symbol)
 
-    def place_trailing_stop(self, symbol, side, qty, trail_percent):
-        self.trailed.append((symbol, side, qty, trail_percent))
+    def place_trailing_stop(self, symbol, side, qty, *, trail_percent=None, trail_price=None):
+        self.trailed.append((symbol, side, qty, trail_percent, trail_price))
         return object()
 
     def flatten_now(self, symbol, side, qty):
@@ -151,24 +151,32 @@ def test_failed_stop_submission_is_escalated(caplog):
 
 
 # ----------------------------------------------------------- orphan trailing-stop
-def _run_orphans(positions, universe, has_trailing=False, dry_run=False):
+def _run_orphans(positions, universe, bars=None, has_trailing=False, dry_run=False):
     om = _FakeOM(has_trailing=has_trailing)
+    md = _FakeMarketData(bars if bars is not None else _flat_bars())
     convert_orphans_to_trailing_stops(
-        om, _FakePortfolio(positions), set(universe), _settings(), dry_run=dry_run)
+        om, _FakePortfolio(positions), set(universe), md, _settings(), dry_run=dry_run)
     return om
 
 
-def test_orphan_dropped_from_universe_gets_trailing_stop():
-    # AAPL is held but no longer in the universe -> cancel its static stop and place
-    # a 5% trailing stop (default orphan_trailing_stop_pct).
+def test_orphan_dropped_from_universe_gets_atr_trailing_stop():
+    # AAPL is held but no longer in the universe -> cancel its static stop and place a
+    # trailing stop at atr_mult × N. Flat bars give ATR=2.0, mult=2.0 -> trail_price 4.0.
     om = _run_orphans([make_position(symbol="AAPL", qty="10", avg="100")], universe=["MSFT"])
     assert om.cancelled == ["AAPL"]
-    assert om.trailed == [("AAPL", OrderSide.SELL, 10, 5.0)]
+    assert om.trailed == [("AAPL", OrderSide.SELL, 10, None, Decimal("4.00"))]
 
 
 def test_short_orphan_gets_buy_trailing_stop():
     om = _run_orphans([make_position(symbol="AAPL", qty="-10", avg="100")], universe=["MSFT"])
-    assert om.trailed == [("AAPL", OrderSide.BUY, 10, 5.0)]
+    assert om.trailed == [("AAPL", OrderSide.BUY, 10, None, Decimal("4.00"))]
+
+
+def test_orphan_without_atr_falls_back_to_percent():
+    # Too few bars for ATR -> fall back to the flat 5% trailing stop.
+    om = _run_orphans([make_position(symbol="AAPL", qty="10", avg="100")],
+                      universe=["MSFT"], bars=_flat_bars(n=5))
+    assert om.trailed == [("AAPL", OrderSide.SELL, 10, 5.0, None)]
 
 
 def test_position_still_in_universe_is_untouched():
@@ -214,16 +222,26 @@ def test_place_protective_stop_submits_gtc(mock_trading_client, portfolio_state)
     assert om.has_protective_stop("AAPL", OrderSide.SELL, 10) is True
 
 
-def test_place_trailing_stop_submits_gtc(mock_trading_client, portfolio_state):
+def test_place_trailing_stop_by_price_submits_gtc(mock_trading_client, portfolio_state):
     from alpaca.trading.requests import TrailingStopOrderRequest
 
     om = OrderManager(mock_trading_client, portfolio_state, dry_run=False)
-    om.place_trailing_stop("AAPL", OrderSide.SELL, 10, 5.0)
+    om.place_trailing_stop("AAPL", OrderSide.SELL, 10, trail_price=Decimal("4"))
     req = mock_trading_client.submit_order.call_args.args[0]
     assert isinstance(req, TrailingStopOrderRequest)
-    assert req.side == AlpacaSide.SELL and req.trail_percent == 5.0 and req.qty == 10
+    assert req.side == AlpacaSide.SELL and req.trail_price == 4.0 and req.qty == 10
     # Tracked as a trailing stop, so a later restart sees it and skips re-converting.
     assert om.has_trailing_stop("AAPL", OrderSide.SELL, 10) is True
+
+
+def test_place_trailing_stop_by_percent_submits_gtc(mock_trading_client, portfolio_state):
+    from alpaca.trading.requests import TrailingStopOrderRequest
+
+    om = OrderManager(mock_trading_client, portfolio_state, dry_run=False)
+    om.place_trailing_stop("AAPL", OrderSide.SELL, 10, trail_percent=5.0)
+    req = mock_trading_client.submit_order.call_args.args[0]
+    assert isinstance(req, TrailingStopOrderRequest)
+    assert req.trail_percent == 5.0 and req.trail_price is None
 
 
 def test_flatten_now_submits_market(mock_trading_client, portfolio_state):
@@ -237,6 +255,6 @@ def test_flatten_now_submits_market(mock_trading_client, portfolio_state):
 def test_dry_run_places_nothing(mock_trading_client, portfolio_state):
     om = OrderManager(mock_trading_client, portfolio_state, dry_run=True)
     assert om.place_protective_stop("AAPL", OrderSide.SELL, 10, Decimal("96")) is None
-    assert om.place_trailing_stop("AAPL", OrderSide.SELL, 10, 5.0) is None
+    assert om.place_trailing_stop("AAPL", OrderSide.SELL, 10, trail_percent=5.0) is None
     assert om.flatten_now("AAPL", OrderSide.SELL, 10) is None
     mock_trading_client.submit_order.assert_not_called()

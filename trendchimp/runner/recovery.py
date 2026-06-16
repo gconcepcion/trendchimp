@@ -104,6 +104,7 @@ def convert_orphans_to_trailing_stops(
     order_manager: "OrderManager",
     portfolio: "PortfolioState",
     universe_symbols: set[str],
+    market_data: "MarketDataClient",
     settings: "TrendChimpSettings",
     dry_run: bool = False,
 ) -> None:
@@ -111,14 +112,14 @@ def convert_orphans_to_trailing_stops(
 
     Such a position is no longer watched by the strategy, so its Donchian exit can
     never fire. Replace its static protective stop with a broker GTC trailing stop
-    so it keeps protecting/ratcheting without being watched. Idempotent: a position
-    already on a trailing stop is left alone.
+    that trails ``orphan_trailing_atr_mult × N`` (ATR), falling back to a flat percent
+    only when ATR can't be computed. Idempotent: a position already on a trailing stop
+    is left alone.
     """
     positions = portfolio.get_all_positions()
     universe = {s.upper() for s in universe_symbols}
-    trail_pct = float(settings.risk.orphan_trailing_stop_pct) * 100.0
-    if trail_pct <= 0:
-        return
+    atr_mult = Decimal(str(settings.risk.orphan_trailing_atr_mult))
+    fallback_pct = float(settings.risk.orphan_trailing_stop_pct) * 100.0
 
     converted = failed = 0
     for pos in positions:
@@ -133,13 +134,24 @@ def convert_orphans_to_trailing_stops(
         if order_manager.has_trailing_stop(symbol, stop_side, qty):
             continue  # already handed off on a prior restart
 
-        logger.info("Converting orphan %s (left the universe) to a %.1f%% trailing stop",
-                    symbol, trail_pct)
+        # Trail atr_mult × N where N is available; otherwise fall back to a flat percent.
+        n, _ = _atr_and_last_close(market_data, symbol, settings)
+        trail_kwargs: dict
+        if n is not None and n > 0:
+            trail_price = (atr_mult * Decimal(str(n))).quantize(Decimal("0.01"))
+            trail_kwargs = {"trail_price": trail_price}
+            logger.info("Converting orphan %s (left the universe) to a %sN ($%s) trailing stop",
+                        symbol, atr_mult, trail_price)
+        else:
+            trail_kwargs = {"trail_percent": fallback_pct}
+            logger.warning("Converting orphan %s — no ATR, using %.1f%% fallback trailing stop",
+                           symbol, fallback_pct)
+
         # Drop the static stop first so the position isn't double-stopped; the window
         # is sub-second and this runs at startup before the stream connects.
         order_manager.cancel_open_stops(symbol)
 
-        if order_manager.place_trailing_stop(symbol, stop_side, qty, trail_pct) is not None or dry_run:
+        if order_manager.place_trailing_stop(symbol, stop_side, qty, **trail_kwargs) is not None or dry_run:
             converted += 1
         else:
             failed += 1
