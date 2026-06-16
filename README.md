@@ -48,7 +48,8 @@ cp .env.example .env   # paste your Alpaca PAPER keys; keep PAPER=true
 trendchimp status      # read-only account summary
 trendchimp positions   # open positions (long & short)
 trendchimp screen      # screen the S&P 500 -> write the trading universe (see below)
-trendchimp run         # start the paper bot
+trendchimp run         # start the paper bot (always-on)
+trendchimp run --once  # batch: act on the latest completed daily bar, then exit
 
 # Full pipeline without sending orders:
 TRENDCHIMP_TRADING__DRY_RUN=true trendchimp run
@@ -56,6 +57,28 @@ TRENDCHIMP_TRADING__DRY_RUN=true trendchimp run
 
 Live trading requires a deliberate double-lock: both `TRENDCHIMP_ALPACA__PAPER=false`
 and `TRENDCHIMP_LIVE_TRADING_CONFIRMED=true`.
+
+### Two ways to operate it
+
+It's a **daily** system, so you can run it either way:
+
+- **Always-on** (`trendchimp run`): stays connected, aggregates the minute stream into
+  daily bars, and trades across the open. Only this mode runs the **intraday kill-switch**
+  (live daily-loss / drawdown halt). Holds the single Alpaca data connection while up.
+- **Batch** (`trendchimp run --once`): on each run it reconciles state, refreshes
+  protective stops, acts on the latest **completed** daily bar, and exits — no live
+  connection. New entries carry a server-side (OTO) stop so they're protected on fill
+  without a listener. Best run a few minutes after the open and cron'd 1–2×/day:
+
+  ```cron
+  # ~5 min after the US open (9:35 ET), Mon–Fri
+  35 13 * * 1-5  cd /path/to/trendchimp && ./venv/bin/trendchimp run --once >> logs/once.log 2>&1
+  ```
+
+  Protective/trailing stops are broker-side (GTC), so positions stay protected between
+  runs even though nothing is connected. Re-running the same day is idempotent (it won't
+  double-enter). The only thing batch mode gives up vs. always-on is the intraday
+  kill-switch.
 
 ## Running it day-to-day (manual)
 
