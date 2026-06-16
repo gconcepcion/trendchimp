@@ -52,12 +52,13 @@ class OrderManager:
             self._orders[managed.order_id] = managed
         logger.info("Reconciled %d open orders from Alpaca", len(open_orders))
 
-    def submit(self, decision: OrderDecision) -> ManagedOrder | None:
+    def submit(self, decision: OrderDecision, attach_stop_bracket: bool = False) -> ManagedOrder | None:
         if self._dry_run:
             logger.info(
-                "[DRY RUN] would %s %d %s (%s) stop=%s",
+                "[DRY RUN] would %s %d %s (%s) stop=%s%s",
                 decision.side.value, decision.qty, decision.symbol,
                 decision.intent.value, decision.stop_price,
+                " [OTO]" if attach_stop_bracket else "",
             )
             return None
 
@@ -65,11 +66,26 @@ class OrderManager:
         from alpaca.trading.requests import MarketOrderRequest
 
         alpaca_side = AlpacaSide.BUY if decision.side == OrderSide.BUY else AlpacaSide.SELL
+        # Batch (no-stream) mode attaches the protective stop server-side as an OTO leg
+        # so the entry is protected on fill without a trade-update listener.
+        order_kwargs: dict = {}
+        if (attach_stop_bracket and decision.intent is not None
+                and decision.intent.is_entry and decision.stop_price is not None):
+            from alpaca.trading.enums import OrderClass
+            from alpaca.trading.requests import StopLossRequest
+
+            order_kwargs = {
+                "order_class": OrderClass.OTO,
+                "stop_loss": StopLossRequest(
+                    stop_price=float(decision.stop_price.quantize(Decimal("0.01"))),
+                ),
+            }
         request = MarketOrderRequest(
             symbol=decision.symbol,
             qty=decision.qty,
             side=alpaca_side,
             time_in_force=TimeInForce.DAY,
+            **order_kwargs,
         )
 
         try:

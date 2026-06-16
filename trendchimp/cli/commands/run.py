@@ -6,8 +6,11 @@ import click
 @click.command()
 @click.option("--env-file", default=".env", show_default=True,
               help="Path to the .env file to load.")
-def run(env_file: str) -> None:
-    """Start the paper-trading bot."""
+@click.option("--once", "once", is_flag=True, default=False,
+              help="Batch mode: act on the latest completed daily bar and exit (no live "
+                   "stream). Run a few minutes after the open; cron 1-2x/day.")
+def run(env_file: str, once: bool) -> None:
+    """Start the paper-trading bot (always-on), or run a single batch pass with --once."""
     from dotenv import load_dotenv
 
     load_dotenv(env_file)
@@ -26,4 +29,8 @@ def run(env_file: str) -> None:
             abort=True,
         )
 
-    TradingBot(settings).start()
+    bot = TradingBot(settings)
+    if once:
+        bot.run_once()
+    else:
+        bot.start()
