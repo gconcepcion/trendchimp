@@ -2,16 +2,20 @@
 
 A Donchian Channel / Turtle breakout trend-following trading bot for [Alpaca](https://alpaca.markets/),
 specialized for **US equities, long and short**. Paper-trading first, with a strict risk
-guardrail layer.
+guardrail layer and an optional AI-assisted universe screener.
 
 ## Architecture
 
 ```
-[ Alpaca market data ] -> [ DonchianBreakoutStrategy ] -> [ RiskManager + KillSwitch ] -> [ OrderManager ]
-        (streams)              (channel + ATR)              (Turtle N-unit sizing,          (2N bracket stop
-                                                             daily-loss kill-switch)          on every entry)
+[ Alpaca minute stream ] -> [ DailyBarAggregator ] -> [ DonchianBreakoutStrategy ] -> [ RiskManager + KillSwitch ] -> [ OrderManager ]
+        (1-min bars)          (rolls up to daily)        (channel + ATR)               (Turtle N-unit sizing,          (2N protective stop
+                                                                                        daily-loss kill-switch)          on every entry)
 ```
 
+- **Data** (`data/aggregator.py`): Alpaca's live websocket only streams **1-minute** bars,
+  so `DailyBarAggregator` rolls them up into completed daily OHLCV bars (regular hours only).
+  Marks and the kill-switch update every minute; the strategy only acts on a completed daily
+  bar, so decisions land at the next session's open (classic next-bar Turtle entry).
 - **Strategy** (`strategies/donchian.py`): breakout above the prior `entry_channel`-bar high
   goes long, below the low goes short; opposite breakout of the shorter `exit_channel` exits.
   Indicators are computed incrementally against *prior* bars only (no look-ahead).
@@ -21,6 +25,10 @@ guardrail layer.
 - **Execution** (`orders/manager.py`): submits whole-share market orders and attaches a 2N
   protective stop to **every** entry on fill — a SELL stop below a long, a BUY-to-cover stop
   above a short.
+- **Startup recovery** (`runner/recovery.py`): on every (re)start the bot guarantees each open
+  position has a live protective stop, healing the crash/disconnect window where an entry
+  filled but its stop was never placed. If a position has already gapped past where its stop
+  should sit, it is flattened at market instead; a stop it cannot place is escalated loudly.
 
 ## Setup
 
@@ -35,6 +43,7 @@ cp .env.example .env   # paste your Alpaca PAPER keys; keep PAPER=true
 ```bash
 trendchimp status      # read-only account summary
 trendchimp positions   # open positions (long & short)
+trendchimp screen      # screen the S&P 500 -> write the trading universe (see below)
 trendchimp run         # start the paper bot
 
 # Full pipeline without sending orders:
@@ -43,6 +52,25 @@ TRENDCHIMP_TRADING__DRY_RUN=true trendchimp run
 
 Live trading requires a deliberate double-lock: both `TRENDCHIMP_ALPACA__PAPER=false`
 and `TRENDCHIMP_LIVE_TRADING_CONFIRMED=true`.
+
+## Universe screener
+
+`trendchimp screen` builds the list of symbols the bot trades. It pulls the S&P 500
+(cached to `screener.cache_dir` for 7 days), scores every name for breakout/trend fitness
+(proximity to the 20-day high, SMA trend alignment, ADX, momentum, with liquidity and
+volatility gates), then asks Claude to pick the final universe from that shortlist. The
+result is written to a JSON universe file.
+
+```bash
+trendchimp screen                 # technical scoring + Claude selection
+trendchimp screen --no-ai         # technical scoring only (no API key needed)
+trendchimp screen --top-n 40 --picks 12 --output universe.json
+```
+
+Point the bot at the file with `TRENDCHIMP_TRADING__UNIVERSE_FILE`. When set and present,
+`run` trades those symbols instead of `TRENDCHIMP_TRADING__SYMBOLS`; otherwise it falls back
+to the hand-configured list. The AI step needs `TRENDCHIMP_SCREENER__ANTHROPIC_API_KEY`
+(model defaults to `claude-opus-4-8`); `--no-ai` skips it and writes the top technical picks.
 
 ## Tests
 

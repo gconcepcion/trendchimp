@@ -17,6 +17,18 @@ logger = logging.getLogger(__name__)
 audit = logging.getLogger("trendchimp.audit")
 
 
+def _enum_str(value: Any) -> str:
+    """Normalize an alpaca-py enum (or plain string) to its lowercase value.
+
+    Alpaca statuses/sides/types are str-enums whose ``str()`` is the *member*
+    repr, not the value: ``str(OrderStatus.FILLED) == 'OrderStatus.FILLED'`` while
+    ``OrderStatus.FILLED.value == 'filled'``. Comparing the former against
+    lowercase literals (``== "filled"``, ``is_open()``) silently never matches,
+    so every enum captured from the broker must pass through here first.
+    """
+    return str(getattr(value, "value", value)).lower()
+
+
 class OrderManager:
     """Submits orders, attaches a 2N protective stop to every entry on fill, and
     tracks order lifecycle. Supports both long and short entries."""
@@ -71,7 +83,7 @@ class OrderManager:
             symbol=decision.symbol,
             side=decision.side,
             qty=Decimal(str(decision.qty)),
-            status=str(raw.status),
+            status=_enum_str(raw.status),
             submitted_at=datetime.now(tz=timezone.utc),
             strategy_name=(
                 decision.originating_signal.strategy_name
@@ -109,7 +121,7 @@ class OrderManager:
             managed = self._from_alpaca_order(order)
             self._orders[order_id] = managed
 
-        managed.status = str(order.status)
+        managed.status = _enum_str(order.status)
         managed.raw = order
 
         if managed.status == "filled":
@@ -147,6 +159,88 @@ class OrderManager:
             logger.info("Cancelled all open orders")
         except Exception:
             logger.exception("Error cancelling all orders")
+
+    # ------------------------------------------------------------ stop recovery
+    def has_protective_stop(self, symbol: str, required_side: OrderSide, qty: int) -> bool:
+        """True if an open tracked stop on `symbol` covers `qty` on the protective side."""
+        symbol = symbol.upper()
+        for o in self._orders.values():
+            if (o.is_stop_order and o.symbol.upper() == symbol and o.is_open()
+                    and o.side == required_side and o.qty >= Decimal(str(qty))):
+                return True
+        return False
+
+    def place_protective_stop(
+        self, symbol: str, side: OrderSide, qty: int, stop_price: Decimal,
+    ) -> ManagedOrder | None:
+        """Place a GTC protective stop for an existing position (recovery path)."""
+        stop_price = stop_price.quantize(Decimal("0.01"))
+        if self._dry_run:
+            logger.info("[DRY RUN] would recover %s stop %d %s @ %s",
+                        side.value, qty, symbol, stop_price)
+            return None
+
+        from alpaca.trading.enums import OrderSide as AlpacaSide, TimeInForce
+        from alpaca.trading.requests import StopOrderRequest
+
+        alpaca_side = AlpacaSide.SELL if side == OrderSide.SELL else AlpacaSide.BUY
+        request = StopOrderRequest(
+            symbol=symbol, qty=qty, side=alpaca_side,
+            stop_price=float(stop_price), time_in_force=TimeInForce.GTC,
+        )
+        try:
+            raw = self._client.submit_order(request)
+        except Exception:
+            logger.exception("Failed to recover protective stop for %s", symbol)
+            return None
+
+        managed = ManagedOrder(
+            order_id=str(raw.id), symbol=symbol.upper(), side=side,
+            qty=Decimal(str(qty)), status=_enum_str(raw.status),
+            submitted_at=datetime.now(tz=timezone.utc), strategy_name="",
+            is_stop_order=True, stop_price=stop_price, raw=raw,
+        )
+        self._orders[managed.order_id] = managed
+        audit.info("STOP_RECOVERED", extra={
+            "order_id": managed.order_id, "symbol": symbol.upper(),
+            "side": side.value, "qty": str(qty), "stop_price": str(stop_price),
+        })
+        logger.info("Recovered protective stop (%s) for %s @ %s [%s]",
+                    side.value, symbol, stop_price, managed.order_id)
+        return managed
+
+    def flatten_now(self, symbol: str, side: OrderSide, qty: int) -> ManagedOrder | None:
+        """Market-exit a position whose protective stop is already breached."""
+        if self._dry_run:
+            logger.info("[DRY RUN] would flatten %s: market %s %d", symbol, side.value, qty)
+            return None
+
+        from alpaca.trading.enums import OrderSide as AlpacaSide, TimeInForce
+        from alpaca.trading.requests import MarketOrderRequest
+
+        alpaca_side = AlpacaSide.SELL if side == OrderSide.SELL else AlpacaSide.BUY
+        request = MarketOrderRequest(
+            symbol=symbol, qty=qty, side=alpaca_side, time_in_force=TimeInForce.DAY,
+        )
+        try:
+            raw = self._client.submit_order(request)
+        except Exception:
+            logger.exception("Failed to flatten %s on recovery", symbol)
+            return None
+
+        managed = ManagedOrder(
+            order_id=str(raw.id), symbol=symbol.upper(), side=side,
+            qty=Decimal(str(qty)), status=_enum_str(raw.status),
+            submitted_at=datetime.now(tz=timezone.utc), strategy_name="", raw=raw,
+        )
+        self._orders[managed.order_id] = managed
+        audit.info("POSITION_FLATTENED_ON_RECOVERY", extra={
+            "order_id": managed.order_id, "symbol": symbol.upper(),
+            "side": side.value, "qty": str(qty),
+        })
+        logger.warning("Flattened %s on recovery (stop already breached): %s %d",
+                       symbol, side.value, qty)
+        return managed
 
     def _attach_protective_stop(self, entry: ManagedOrder) -> None:
         from alpaca.trading.enums import OrderSide as AlpacaSide, TimeInForce
@@ -187,7 +281,7 @@ class OrderManager:
             symbol=entry.symbol,
             side=OrderSide.SELL if stop_side == AlpacaSide.SELL else OrderSide.BUY,
             qty=Decimal(str(qty_whole)),
-            status=str(raw.status),
+            status=_enum_str(raw.status),
             submitted_at=datetime.now(tz=timezone.utc),
             strategy_name=entry.strategy_name,
             is_stop_order=True,
@@ -225,15 +319,20 @@ class OrderManager:
                     logger.exception("Failed to cancel stop %s for %s", managed.order_id, symbol)
 
     def _from_alpaca_order(self, order: Any) -> ManagedOrder:
-        raw_side = str(getattr(order, "side", "buy")).lower()
+        raw_side = _enum_str(getattr(order, "side", "buy"))
         side = OrderSide.BUY if raw_side == "buy" else OrderSide.SELL
+        order_type = _enum_str(getattr(order, "type", ""))
+        is_stop = "stop" in order_type  # "stop" / "stop_limit" / "trailing_stop"
+        stop_raw = getattr(order, "stop_price", None)
         return ManagedOrder(
             order_id=str(order.id),
             symbol=str(order.symbol).upper(),
             side=side,
             qty=Decimal(str(order.qty or 0)),
-            status=str(order.status),
+            status=_enum_str(order.status),
             submitted_at=getattr(order, "submitted_at", datetime.now(tz=timezone.utc)),
             strategy_name="",
+            is_stop_order=is_stop,
+            stop_price=Decimal(str(stop_raw)) if stop_raw is not None else None,
             raw=order,
         )

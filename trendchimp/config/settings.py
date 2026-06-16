@@ -21,6 +21,9 @@ class TradingSettings(BaseSettings):
     symbols: list[str] = ["AAPL"]
     timeframe: str = "1Day"  # Turtle is a daily-bar system by default
     dry_run: bool = False
+    # If set and the file exists, the bot trades the symbols from this universe
+    # file (written by `trendchimp screen`) instead of `symbols`.
+    universe_file: str = ""
 
 
 class StrategySettings(BaseSettings):
@@ -41,6 +44,19 @@ class RiskSettings(BaseSettings):
     max_drawdown_pct: float = 0.20      # kill-switch: halt if peak-to-now drawdown >= 20%
     max_position_pct: float = 0.20      # hard cap on any single unit's notional vs equity
     allow_short: bool = True
+    # Startup stop-recovery: stop distance used only when ATR can't be computed.
+    recovery_fallback_stop_pct: float = 0.10
+
+
+class ScreenerSettings(BaseSettings):
+    model_config = SettingsConfigDict(extra="ignore")
+
+    anthropic_api_key: str = ""
+    model: str = "claude-opus-4-8"   # cheaper drop-in: claude-sonnet-4-6
+    top_n_technical: int = 30        # breakout candidates passed to Claude
+    final_picks: int = 10            # tickers Claude selects for the universe
+    lookback_days: int = 260         # daily bars fetched per symbol (SMA200 + buffer)
+    cache_dir: str = "./cache"       # where the S&P 500 list is cached
 
 
 class LoggingSettings(BaseSettings):
@@ -64,6 +80,7 @@ class TrendChimpSettings(BaseSettings):
     trading: TradingSettings = TradingSettings()
     strategy: StrategySettings = StrategySettings()
     risk: RiskSettings = RiskSettings()
+    screener: ScreenerSettings = ScreenerSettings()
     logging: LoggingSettings = LoggingSettings()
 
     # Must be set explicitly to enable live trading alongside paper=False
