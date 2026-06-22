@@ -66,7 +66,10 @@ class RiskManager:
             logger.warning("Entry signal for %s missing entry_price/atr metadata", signal.symbol)
             return None
 
-        qty = self._sizer.size(entry_price, n, account.equity, account.buying_power)
+        qty = self._sizer.size(
+            entry_price, n, account.equity, account.buying_power,
+            portfolio.get_gross_exposure(),
+        )
         if qty < 1:
             logger.debug("Computed qty<1 for %s — skipping", signal.symbol)
             return None

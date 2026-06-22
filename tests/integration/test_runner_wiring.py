@@ -11,7 +11,8 @@ from trendchimp.strategies.donchian import DonchianBreakoutStrategy
 
 def _wire(mock_trading_client, portfolio_state):
     risk = RiskSettings()
-    sizer = TurtleUnitSizer(risk.risk_per_trade_pct, risk.atr_stop_mult, risk.max_position_pct)
+    sizer = TurtleUnitSizer(risk.risk_per_trade_pct, risk.atr_stop_mult,
+                            risk.max_position_pct, risk.max_gross_exposure_pct)
     killswitch = KillSwitch(risk.daily_loss_limit_pct, risk.max_drawdown_pct)
     risk_manager = RiskManager(risk, sizer, killswitch)
     order_manager = OrderManager(mock_trading_client, portfolio_state, dry_run=False)

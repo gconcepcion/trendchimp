@@ -242,6 +242,7 @@ class TradingBot:
             risk_per_trade_pct=self._settings.risk.risk_per_trade_pct,
             atr_stop_mult=self._settings.risk.atr_stop_mult,
             max_position_pct=self._settings.risk.max_position_pct,
+            max_gross_exposure_pct=self._settings.risk.max_gross_exposure_pct,
         )
         killswitch = KillSwitch(
             daily_loss_limit_pct=self._settings.risk.daily_loss_limit_pct,

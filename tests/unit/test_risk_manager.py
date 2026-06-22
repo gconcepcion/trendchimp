@@ -28,7 +28,8 @@ def _portfolio(positions=(), equity="100000"):
 
 def _manager(risk=None, killswitch=None):
     risk = risk or RiskSettings()
-    sizer = TurtleUnitSizer(risk.risk_per_trade_pct, risk.atr_stop_mult, risk.max_position_pct)
+    sizer = TurtleUnitSizer(risk.risk_per_trade_pct, risk.atr_stop_mult,
+                            risk.max_position_pct, risk.max_gross_exposure_pct)
     return RiskManager(risk, sizer, killswitch)
 
 

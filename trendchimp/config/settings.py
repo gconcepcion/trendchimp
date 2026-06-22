@@ -43,6 +43,7 @@ class RiskSettings(BaseSettings):
     daily_loss_limit_pct: float = 0.02  # kill-switch: halt if daily P&L <= -2% of equity
     max_drawdown_pct: float = 0.20      # kill-switch: halt if peak-to-now drawdown >= 20%
     max_position_pct: float = 0.20      # hard cap on any single unit's notional vs equity
+    max_gross_exposure_pct: float = 1.0  # cap total open notional vs equity (1.0 = no margin)
     allow_short: bool = True
     # Startup stop-recovery: stop distance used only when ATR can't be computed.
     recovery_fallback_stop_pct: float = 0.10
