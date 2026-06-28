@@ -52,6 +52,10 @@ class RiskSettings(BaseSettings):
     # below is only a fallback for when ATR can't be computed (too little history).
     orphan_trailing_atr_mult: float = 2.0
     orphan_trailing_stop_pct: float = 0.05
+    # Live-mode watchdog: re-assert protective stops on the running book at most this
+    # often (minutes) so a stop cancelled/rejected mid-session is repaired without a
+    # restart. 0 disables the watchdog (startup recovery still runs).
+    stop_watchdog_minutes: int = 15
 
 
 class ScreenerSettings(BaseSettings):
@@ -68,6 +72,26 @@ class ScreenerSettings(BaseSettings):
     # share of a $300+ stock within the 20% position cap).
     min_price: float = 0.0
     max_price: float = 0.0
+
+
+class AlertSettings(BaseSettings):
+    """Email/SMTP alerting for safety-critical events (unprotected positions,
+    kill-switch trips). Disabled by default; a no-op notifier is used until both an
+    SMTP host and at least one recipient are configured."""
+
+    model_config = SettingsConfigDict(extra="ignore")
+
+    enabled: bool = False
+    smtp_host: str = ""
+    smtp_port: int = 587
+    smtp_username: str = ""
+    smtp_password: str = ""
+    use_tls: bool = True
+    email_from: str = ""
+    email_to: str = ""  # comma-separated recipients
+    # Fail-safe policy: when a position genuinely can't be protected, halt all new
+    # entries (keep the position, alert) until the bot is restarted / cleared.
+    halt_entries_on_unprotected: bool = True
 
 
 class LoggingSettings(BaseSettings):
@@ -92,6 +116,7 @@ class TrendChimpSettings(BaseSettings):
     strategy: StrategySettings = StrategySettings()
     risk: RiskSettings = RiskSettings()
     screener: ScreenerSettings = ScreenerSettings()
+    alerts: AlertSettings = AlertSettings()
     logging: LoggingSettings = LoggingSettings()
 
     # Must be set explicitly to enable live trading alongside paper=False

@@ -26,11 +26,11 @@ def _portfolio(positions=(), equity="100000"):
     return state
 
 
-def _manager(risk=None, killswitch=None):
+def _manager(risk=None, killswitch=None, safety=None):
     risk = risk or RiskSettings()
     sizer = TurtleUnitSizer(risk.risk_per_trade_pct, risk.atr_stop_mult,
                             risk.max_position_pct, risk.max_gross_exposure_pct)
-    return RiskManager(risk, sizer, killswitch)
+    return RiskManager(risk, sizer, killswitch, safety=safety)
 
 
 def _entry_signal(intent, side, entry="100", atr="2", stop="96", symbol="AAPL"):
@@ -94,6 +94,27 @@ def test_killswitch_blocks_new_entry():
     mgr = _manager(killswitch=tripped)
     decision = mgr.evaluate(_entry_signal(TradeIntent.ENTER_LONG, OrderSide.BUY), _portfolio())
     assert decision is None
+
+
+def test_safety_halt_blocks_new_entry():
+    from trendchimp.safety import SafetyController
+
+    safety = SafetyController(halt_on_unprotected=True)
+    safety.position_unprotected("MSFT", OrderSide.SELL, 5)  # latch the halt
+    mgr = _manager(safety=safety)
+    decision = mgr.evaluate(_entry_signal(TradeIntent.ENTER_LONG, OrderSide.BUY), _portfolio())
+    assert decision is None
+
+
+def test_safety_halt_still_allows_exit():
+    from trendchimp.safety import SafetyController
+
+    safety = SafetyController(halt_on_unprotected=True)
+    safety.position_unprotected("AAPL", OrderSide.SELL, 7)  # latch the halt
+    mgr = _manager(safety=safety)
+    pf = _portfolio(positions=[make_position(qty="7")])
+    decision = mgr.evaluate(_exit_signal(TradeIntent.EXIT_LONG, OrderSide.SELL), pf)
+    assert decision is not None and decision.qty == 7
 
 
 def test_exit_with_no_position_returns_none():

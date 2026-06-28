@@ -16,6 +16,7 @@ if TYPE_CHECKING:
     from trendchimp.config.settings import TrendChimpSettings
     from trendchimp.orders.manager import OrderManager
     from trendchimp.portfolio.state import PortfolioState
+    from trendchimp.safety import SafetyController
 
 logger = logging.getLogger(__name__)
 audit = logging.getLogger("trendchimp.audit")
@@ -27,11 +28,17 @@ def recover_protective_stops(
     market_data: "MarketDataClient",
     settings: "TrendChimpSettings",
     dry_run: bool = False,
+    safety: "SafetyController | None" = None,
+    market_open: bool = True,
 ) -> None:
     """On (re)start, guarantee every open position has a live protective stop.
 
     Closes the crash/disconnect window where an entry filled but its stop was
     never placed. Idempotent: positions already protected are left untouched.
+
+    ``market_open`` controls how an already-breached position is handled: when the
+    market is open it is flattened at market; when closed a DAY market order would
+    just be rejected, so a resting stop is placed to resolve at the open instead.
     """
     positions = portfolio.get_all_positions()
     if not positions:
@@ -50,9 +57,16 @@ def recover_protective_stops(
         is_long = pos.qty > 0
         stop_side = OrderSide.SELL if is_long else OrderSide.BUY
 
-        if order_manager.has_protective_stop(symbol, stop_side, qty):
+        # Only protect the *uncovered* remainder: summed existing stops may already
+        # cover some or all of the position (partial fill / reconciled bracket leg).
+        # Topping up the remainder avoids both an under-covered position and a
+        # duplicate over-size stop (which would go naked-reverse once one fills).
+        covered = order_manager.open_stop_qty(symbol, stop_side)
+        uncovered = qty - covered
+        if uncovered <= 0:
             protected += 1
             continue
+        qty = uncovered
 
         n, last_close = _atr_and_last_close(market_data, symbol, settings)
         entry = pos.avg_entry_price
@@ -74,9 +88,44 @@ def recover_protective_stops(
             ref_price is not None
             and ((is_long and ref_price <= stop_price) or (not is_long and ref_price >= stop_price))
         )
+        if breached and not market_open:
+            # Can't market-flatten a closed market; rest a stop so it resolves at the
+            # open instead of firing a DAY market order the broker will reject.
+            logger.warning(
+                "Stop recovery: %s breached but market is closed — placing a resting "
+                "stop to trigger at the open instead of a rejected market flatten.", symbol)
+            if order_manager.place_protective_stop(symbol, stop_side, qty, stop_price) is not None or dry_run:
+                recovered += 1
+            else:
+                failed += 1
+                audit.error("STOP_RECOVERY_FAILED", extra={
+                    "symbol": symbol, "side": stop_side.value,
+                    "qty": str(qty), "stop_price": str(stop_price),
+                })
+                logger.critical(
+                    "Stop recovery FAILED for %s (market closed) — position is unprotected "
+                    "(%d shares, stop %s). Place a stop manually.", symbol, qty, stop_price)
+                if safety is not None:
+                    safety.position_unprotected(symbol, stop_side, qty, reason="stop_recovery_failed_closed")
+            continue
+
         if breached:
-            order_manager.flatten_now(symbol, stop_side, qty)
-            flattened += 1
+            if order_manager.flatten_now(symbol, stop_side, qty) is not None or dry_run:
+                flattened += 1
+            else:
+                # The emergency exit failed to submit: the position is breached,
+                # unprotected, and still open. Surface it loudly rather than
+                # silently counting it as flattened.
+                failed += 1
+                audit.error("FLATTEN_ON_RECOVERY_FAILED", extra={
+                    "symbol": symbol, "side": stop_side.value, "qty": str(qty),
+                })
+                logger.critical(
+                    "Emergency flatten FAILED for %s — breached position is unprotected "
+                    "and still open (%d shares). Flatten manually now.", symbol, qty,
+                )
+                if safety is not None:
+                    safety.position_unprotected(symbol, stop_side, qty, reason="flatten_failed")
             continue
 
         if order_manager.place_protective_stop(symbol, stop_side, qty, stop_price) is not None or dry_run:
@@ -94,6 +143,8 @@ def recover_protective_stops(
                 "Stop recovery FAILED for %s — position is unprotected (%d shares, stop %s). "
                 "Place a stop manually or restart.", symbol, qty, stop_price,
             )
+            if safety is not None:
+                safety.position_unprotected(symbol, stop_side, qty, reason="stop_recovery_failed")
 
     log = logger.error if failed else logger.info
     log("Stop recovery complete: %d recovered, %d flattened, %d already protected, %d FAILED",
@@ -147,20 +198,21 @@ def convert_orphans_to_trailing_stops(
             logger.warning("Converting orphan %s — no ATR, using %.1f%% fallback trailing stop",
                            symbol, fallback_pct)
 
-        # Drop the static stop first so the position isn't double-stopped; the window
-        # is sub-second and this runs at startup before the stream connects.
-        order_manager.cancel_open_stops(symbol)
-
+        # Place the trailing stop FIRST, then cancel the static one. A brief
+        # double-stop is harmless; a brief no-stop is not. If the trailing stop
+        # can't be placed, keep the static stop so the position stays protected.
         if order_manager.place_trailing_stop(symbol, stop_side, qty, **trail_kwargs) is not None or dry_run:
+            order_manager.cancel_open_stops(symbol)
             converted += 1
         else:
             failed += 1
             audit.error("ORPHAN_TRAIL_FAILED", extra={
                 "symbol": symbol, "side": stop_side.value, "qty": str(qty),
             })
-            logger.critical(
-                "Orphan trailing-stop FAILED for %s — its static stop was cancelled and the "
-                "position is now UNPROTECTED (%d shares). Place a stop manually.", symbol, qty,
+            logger.error(
+                "Orphan trailing-stop FAILED for %s — kept the existing static stop so "
+                "the position stays protected; it just won't trail. Will retry on the "
+                "next pass.", symbol,
             )
 
     if converted or failed:

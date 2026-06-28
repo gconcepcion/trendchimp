@@ -49,7 +49,10 @@ class ManagedOrder:
     raw: Any = field(default=None, repr=False)
 
     def is_open(self) -> bool:
-        return self.status in ("new", "partially_filled", "accepted", "pending_new")
+        # "held" covers an OTO/bracket child stop leg that is live at the broker but
+        # not yet activated (waiting on the entry to fill) — it is still resting
+        # protection and must count as open.
+        return self.status in ("new", "partially_filled", "accepted", "pending_new", "held")
 
     def is_filled(self) -> bool:
         return self.status == "filled"

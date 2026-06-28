@@ -12,6 +12,7 @@ from trendchimp.signals.models import OrderSide, TradeIntent
 if TYPE_CHECKING:
     from trendchimp.clients.trading import TradingClientWrapper
     from trendchimp.portfolio.state import PortfolioState
+    from trendchimp.safety import SafetyController
 
 logger = logging.getLogger(__name__)
 audit = logging.getLogger("trendchimp.audit")
@@ -38,10 +39,12 @@ class OrderManager:
         trading_client: "TradingClientWrapper",
         portfolio_state: "PortfolioState",
         dry_run: bool = False,
+        safety: "SafetyController | None" = None,
     ) -> None:
         self._client = trading_client
         self._portfolio = portfolio_state
         self._dry_run = dry_run
+        self._safety = safety
         self._orders: dict[str, ManagedOrder] = {}
 
     def reconcile(self) -> None:
@@ -111,6 +114,14 @@ class OrderManager:
             raw=raw,
         )
         self._orders[managed.order_id] = managed
+        # Register any OTO/bracket child legs (the protective stop) immediately, so the
+        # fill-time path recognises the resting stop and never places a duplicate. The
+        # leg arrives 'held' until the entry fills.
+        legs = getattr(raw, "legs", None)
+        if isinstance(legs, (list, tuple)):
+            for leg in legs:
+                child = self._from_alpaca_order(leg)
+                self._orders[child.order_id] = child
         audit.info(
             "ORDER_SUBMITTED",
             extra={
@@ -176,15 +187,48 @@ class OrderManager:
         except Exception:
             logger.exception("Error cancelling all orders")
 
+    def cancel_open_entries(self) -> None:
+        """Cancel pending *entry* orders only, leaving protective/trailing stops
+        resting at the broker.
+
+        Used on the kill-switch shutdown path: the bot is about to go offline, so it
+        must withdraw unfilled entries it can no longer manage while keeping every
+        open position protected. Cancelling the stops here (as ``cancel_all`` would)
+        leaves the book naked the moment the process exits.
+        """
+        cancelled = 0
+        for managed in self.get_active_orders():
+            if managed.is_stop_order:
+                continue
+            try:
+                self._client.cancel_order(managed.order_id)
+                managed.status = "canceled"
+                audit.info("ENTRY_CANCELLED",
+                           extra={"order_id": managed.order_id, "symbol": managed.symbol})
+                cancelled += 1
+            except Exception:
+                logger.exception("Failed to cancel entry order %s", managed.order_id)
+        logger.info("Cancelled %d open entry order(s); protective stops left in place",
+                    cancelled)
+
     # ------------------------------------------------------------ stop recovery
-    def has_protective_stop(self, symbol: str, required_side: OrderSide, qty: int) -> bool:
-        """True if an open tracked stop on `symbol` covers `qty` on the protective side."""
+    def open_stop_qty(self, symbol: str, required_side: OrderSide) -> int:
+        """Total open protective/trailing-stop quantity on `symbol`/`required_side`.
+
+        Summed across orders so a position covered by several smaller stops (e.g. a
+        partial fill, or a reconciled bracket leg) is recognised as protected rather
+        than triggering a duplicate full-size stop."""
         symbol = symbol.upper()
+        total = Decimal(0)
         for o in self._orders.values():
             if (o.is_stop_order and o.symbol.upper() == symbol and o.is_open()
-                    and o.side == required_side and o.qty >= Decimal(str(qty))):
-                return True
-        return False
+                    and o.side == required_side):
+                total += o.qty
+        return int(total)
+
+    def has_protective_stop(self, symbol: str, required_side: OrderSide, qty: int) -> bool:
+        """True if open stops on `symbol`/`required_side` cover at least `qty` shares."""
+        return self.open_stop_qty(symbol, required_side) >= qty
 
     def has_trailing_stop(self, symbol: str, required_side: OrderSide, qty: int) -> bool:
         """True if an open tracked *trailing* stop on `symbol` covers `qty`."""
@@ -325,6 +369,13 @@ class OrderManager:
         return managed
 
     def _attach_protective_stop(self, entry: ManagedOrder) -> None:
+        """On an entry fill, guarantee the position is protected.
+
+        Entries now carry a server-side OTO stop, so the broker usually already holds
+        a resting stop by the time the fill is processed. This path is therefore an
+        idempotent *verification/fallback*: if a protective stop already covers the
+        position it does nothing; otherwise it places one and, if that fails,
+        escalates loudly (the position is naked)."""
         from alpaca.trading.enums import OrderSide as AlpacaSide, TimeInForce
         from alpaca.trading.requests import StopOrderRequest
 
@@ -339,29 +390,36 @@ class OrderManager:
             return
 
         # Opposite side of the entry: long entry -> SELL stop below; short -> BUY stop above.
-        if entry.intent == TradeIntent.ENTER_LONG:
-            stop_side = AlpacaSide.SELL
-        else:
-            stop_side = AlpacaSide.BUY
-        stop_price = entry.stop_price.quantize(Decimal("0.01"))
+        stop_side = OrderSide.SELL if entry.intent == TradeIntent.ENTER_LONG else OrderSide.BUY
 
+        # Idempotency: the OTO bracket (or a prior pass) may already hold the stop.
+        # Submitting a second one would leave a naked reverse position once one fills.
+        if self.has_protective_stop(entry.symbol, stop_side, qty_whole):
+            logger.info("Protective stop already resting for %s — fill verified", entry.symbol)
+            entry.entry_price = entry.filled_avg_price
+            return
+
+        stop_price = entry.stop_price.quantize(Decimal("0.01"))
+        alpaca_side = AlpacaSide.SELL if stop_side == OrderSide.SELL else AlpacaSide.BUY
         request = StopOrderRequest(
             symbol=entry.symbol,
             qty=qty_whole,
-            side=stop_side,
+            side=alpaca_side,
             stop_price=float(stop_price),
             time_in_force=TimeInForce.GTC,
         )
         try:
             raw = self._client.submit_order(request)
         except Exception:
-            logger.exception("Failed to submit protective stop for %s", entry.symbol)
+            logger.exception("Failed to submit fallback protective stop for %s", entry.symbol)
+            self._escalate_unprotected(entry.symbol, stop_side, qty_whole,
+                                       stop_price=stop_price, reason="stop_attach_failed")
             return
 
         stop_managed = ManagedOrder(
             order_id=str(raw.id),
             symbol=entry.symbol,
-            side=OrderSide.SELL if stop_side == AlpacaSide.SELL else OrderSide.BUY,
+            side=stop_side,
             qty=Decimal(str(qty_whole)),
             status=_enum_str(raw.status),
             submitted_at=datetime.now(tz=timezone.utc),
@@ -384,6 +442,28 @@ class OrderManager:
         )
         logger.info("Protective stop (%s) submitted for %s @ %s [%s]",
                     stop_managed.side.value, entry.symbol, stop_price, stop_managed.order_id)
+
+    def _escalate_unprotected(
+        self, symbol: str, side: OrderSide, qty: int, *,
+        stop_price: Decimal | None = None, reason: str = "",
+    ) -> None:
+        """Single chokepoint for 'a live position is unprotected'.
+
+        Writes a CRITICAL log and an audit error. The fail-safe latch and external
+        alert are wired in here so every naked-position path triggers them uniformly.
+        """
+        audit.error("STOP_ATTACH_FAILED", extra={
+            "symbol": symbol.upper(), "side": side.value, "qty": str(qty),
+            "stop_price": str(stop_price) if stop_price is not None else "",
+            "reason": reason,
+        })
+        logger.critical(
+            "Position %s is UNPROTECTED (%d shares, %s) — fallback stop could not be "
+            "placed (%s). Place a stop manually now.",
+            symbol, qty, side.value, reason,
+        )
+        if self._safety is not None:
+            self._safety.position_unprotected(symbol, side, qty, reason=reason)
 
     def _cancel_open_stops(self, symbol: str) -> None:
         """Cancel any still-open protective stop for a symbol after it is flattened."""

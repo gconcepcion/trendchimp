@@ -18,16 +18,22 @@ from trendchimp.signals.models import OrderSide
 
 # ----------------------------------------------------------- routine-level tests
 class _FakeOM:
-    def __init__(self, has_stop=False, has_trailing=False):
+    def __init__(self, has_stop=False, has_trailing=False, covered=None):
         self._has = has_stop
         self._has_trailing = has_trailing
+        self._covered = covered
         self.placed: list = []
         self.flattened: list = []
         self.trailed: list = []
         self.cancelled: list = []
 
     def has_protective_stop(self, symbol, side, qty):
-        return self._has
+        return self.open_stop_qty(symbol, side) >= qty
+
+    def open_stop_qty(self, symbol, side):
+        if self._covered is not None:
+            return self._covered
+        return 9999 if self._has else 0
 
     def has_trailing_stop(self, symbol, side, qty):
         return self._has_trailing
@@ -92,6 +98,29 @@ def test_already_protected_does_nothing():
     assert om.placed == [] and om.flattened == []
 
 
+def test_partial_existing_stop_tops_up_only_the_remainder():
+    # Position is 10 shares but only 4 are covered by an existing stop -> place a
+    # stop for the uncovered 6, never a fresh full-size 10 (which would over-stop and
+    # leave a naked reverse position once one fills).
+    om = _FakeOM(covered=4)
+    recover_protective_stops(
+        om, _FakePortfolio([make_position(qty="10", avg="100")]),
+        _FakeMarketData(_flat_bars()), _settings())
+    assert len(om.placed) == 1
+    _, _, qty, _ = om.placed[0]
+    assert qty == 6
+
+
+def test_fully_covered_across_multiple_stops_is_skipped():
+    # Two stops of 5 each fully cover a 10-share position -> no single stop is >= 10,
+    # but the summed coverage is, so recovery must NOT place a duplicate.
+    om = _FakeOM(covered=10)
+    recover_protective_stops(
+        om, _FakePortfolio([make_position(qty="10", avg="100")]),
+        _FakeMarketData(_flat_bars()), _settings())
+    assert om.placed == []
+
+
 def test_long_without_stop_places_sell_stop_at_2n():
     om = _run([make_position(qty="10", avg="100")], _flat_bars())
     assert len(om.placed) == 1
@@ -111,6 +140,25 @@ def test_breached_long_is_flattened():
     # Entry 100 but price now 90, below the 96 stop -> exit at market, no stop.
     om = _run([make_position(qty="10", avg="100")], _flat_bars(close=90.0))
     assert om.placed == []
+    assert om.flattened == [("AAPL", OrderSide.SELL, 10)]
+
+
+def test_breached_when_market_closed_places_stop_not_market_order():
+    # Breached overnight, but the market is closed: a DAY market flatten would just be
+    # rejected. Instead rest a protective stop so it resolves at the open.
+    om = _FakeOM()
+    recover_protective_stops(
+        om, _FakePortfolio([make_position(qty="10", avg="100")]),
+        _FakeMarketData(_flat_bars(close=90.0)), _settings(), market_open=False)
+    assert om.flattened == []
+    assert len(om.placed) == 1
+
+
+def test_breached_when_market_open_still_flattens():
+    om = _FakeOM()
+    recover_protective_stops(
+        om, _FakePortfolio([make_position(qty="10", avg="100")]),
+        _FakeMarketData(_flat_bars(close=90.0)), _settings(), market_open=True)
     assert om.flattened == [("AAPL", OrderSide.SELL, 10)]
 
 
@@ -135,6 +183,24 @@ def test_live_price_gap_triggers_flatten():
     assert om.flattened == [("AAPL", OrderSide.SELL, 10)]
 
 
+def test_failed_emergency_flatten_is_escalated(caplog):
+    """A breached position whose flatten submission fails is unprotected AND still
+    open — it must be escalated loudly, not silently counted as flattened."""
+    import logging
+
+    class _FailingFlattenOM(_FakeOM):
+        def flatten_now(self, symbol, side, qty):
+            return None  # simulate a rejected/failed emergency exit
+
+    om = _FailingFlattenOM()
+    with caplog.at_level(logging.CRITICAL):
+        # close 90 is below the 96 stop -> breached -> flatten path.
+        recover_protective_stops(
+            om, _FakePortfolio([make_position(qty="10", avg="100")]),
+            _FakeMarketData(_flat_bars(close=90.0)), _settings())
+    assert any("unprotected" in r.message.lower() for r in caplog.records)
+
+
 def test_failed_stop_submission_is_escalated(caplog):
     import logging
 
@@ -148,6 +214,20 @@ def test_failed_stop_submission_is_escalated(caplog):
             om, _FakePortfolio([make_position(qty="10", avg="100")]),
             _FakeMarketData(_flat_bars()), _settings())
     assert any("unprotected" in r.message.lower() for r in caplog.records)
+
+
+def test_failed_recovery_drives_safety_halt():
+    from trendchimp.safety import SafetyController
+
+    class _FailingOM(_FakeOM):
+        def place_protective_stop(self, symbol, side, qty, stop_price):
+            return None
+
+    safety = SafetyController(halt_on_unprotected=True)
+    recover_protective_stops(
+        _FailingOM(), _FakePortfolio([make_position(qty="10", avg="100")]),
+        _FakeMarketData(_flat_bars()), _settings(), safety=safety)
+    assert safety.halt_entries is True
 
 
 # ----------------------------------------------------------- orphan trailing-stop
@@ -182,6 +262,24 @@ def test_orphan_without_atr_falls_back_to_percent():
 def test_position_still_in_universe_is_untouched():
     om = _run_orphans([make_position(symbol="AAPL", qty="10", avg="100")], universe=["AAPL"])
     assert om.trailed == [] and om.cancelled == []
+
+
+def test_orphan_trailing_failure_keeps_static_stop(caplog):
+    """If the trailing stop can't be placed, the existing static protective stop must
+    NOT be cancelled — a brief double-stop is safe, a brief no-stop is not."""
+    import logging
+
+    class _FailingTrailOM(_FakeOM):
+        def place_trailing_stop(self, symbol, side, qty, *, trail_percent=None, trail_price=None):
+            return None  # simulate a rejected trailing-stop submission
+
+    om = _FailingTrailOM()
+    with caplog.at_level(logging.ERROR):
+        convert_orphans_to_trailing_stops(
+            om, _FakePortfolio([make_position(symbol="AAPL", qty="10", avg="100")]),
+            {"MSFT"}, _FakeMarketData(_flat_bars()), _settings())
+    # Placement failed, so the static stop is left in place (never cancelled).
+    assert om.cancelled == []
 
 
 def test_orphan_already_trailing_is_skipped():
