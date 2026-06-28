@@ -34,6 +34,7 @@ class SafetyController:
         self._halt_on_unprotected = halt_on_unprotected
         self._halt_entries = False
         self._halt_reason: str | None = None
+        self._alerted: set[tuple[str, str]] = set()
 
     @property
     def halt_entries(self) -> bool:
@@ -57,6 +58,12 @@ class SafetyController:
             self._halt_reason = f"unprotected position {symbol}"
             audit.error("ENTRIES_HALTED", extra={"symbol": symbol, "reason": reason})
             logger.critical("New entries HALTED — %s is unprotected (%s).", symbol, reason)
+        # De-dupe alerts: the watchdog re-runs recovery every interval, so a position
+        # that stays unprotected would otherwise email on every cycle. Alert once per
+        # (symbol, reason); the latched halt and audit log already track the state.
+        if (symbol, reason) in self._alerted:
+            return
+        self._alerted.add((symbol, reason))
         self._notifier.alert(
             subject=f"[trendchimp] UNPROTECTED position: {symbol}",
             body=(

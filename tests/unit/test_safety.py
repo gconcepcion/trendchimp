@@ -30,6 +30,24 @@ def test_halt_disabled_still_alerts_but_does_not_latch():
     notifier.alert.assert_called_once()
 
 
+def test_repeated_unprotected_alert_is_deduped():
+    """The watchdog re-runs recovery every interval; a persistently unprotected
+    position must not email on every cycle — alert once per (symbol, reason)."""
+    notifier = MagicMock()
+    sc = SafetyController(notifier=notifier, halt_on_unprotected=True)
+    sc.position_unprotected("AAPL", OrderSide.SELL, 10, reason="stop_recovery_failed")
+    sc.position_unprotected("AAPL", OrderSide.SELL, 10, reason="stop_recovery_failed")
+    assert notifier.alert.call_count == 1
+
+
+def test_distinct_unprotected_events_each_alert():
+    notifier = MagicMock()
+    sc = SafetyController(notifier=notifier, halt_on_unprotected=True)
+    sc.position_unprotected("AAPL", OrderSide.SELL, 10, reason="stop_recovery_failed")
+    sc.position_unprotected("MSFT", OrderSide.SELL, 5, reason="stop_recovery_failed")
+    assert notifier.alert.call_count == 2
+
+
 def test_notify_passes_through_to_notifier():
     notifier = MagicMock()
     sc = SafetyController(notifier=notifier)

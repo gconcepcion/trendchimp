@@ -38,3 +38,28 @@ def test_watchdog_disabled_when_interval_zero():
     bot._apply_startup_stops = lambda c: calls.append(1)  # type: ignore[method-assign]
     bot._maybe_run_watchdog(object(), now=_T0)
     assert calls == []
+
+
+def test_watchdog_exception_does_not_propagate():
+    """A recovery failure inside the watchdog must not bubble out of the live bar
+    loop (which would silently tear down the stream)."""
+    bot = _bot(5)
+
+    def _boom(c):
+        raise RuntimeError("recovery blew up")
+
+    bot._apply_startup_stops = _boom  # type: ignore[method-assign]
+    # Should swallow-and-log, not raise.
+    bot._maybe_run_watchdog(object(), now=_T0)
+
+
+def test_is_market_open_fails_closed_on_error():
+    """If the clock can't be read, assume CLOSED so recovery rests a stop instead of
+    firing a DAY market flatten the broker would reject."""
+    from types import SimpleNamespace
+
+    bot = _bot(5)
+    client = SimpleNamespace()
+    client.get_clock = lambda: (_ for _ in ()).throw(RuntimeError("no clock"))
+    c = SimpleNamespace(trading_client=client)
+    assert bot._is_market_open(c) is False

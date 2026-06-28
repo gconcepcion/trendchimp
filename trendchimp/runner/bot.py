@@ -293,13 +293,14 @@ class TradingBot:
 
     @staticmethod
     def _is_market_open(c: SimpleNamespace) -> bool:
-        """Best-effort market-open check for recovery decisions. Assumes open on any
-        error so a breached position is still acted on rather than silently held."""
+        """Best-effort market-open check for recovery decisions. Fails CLOSED on any
+        error: a breached position then rests a protective stop (which resolves at the
+        open) instead of firing a DAY market flatten the broker would reject."""
         try:
             return bool(c.trading_client.get_clock().is_open)
         except Exception:
-            logger.warning("Could not read market clock — assuming market open for recovery")
-            return True
+            logger.warning("Could not read market clock — assuming market CLOSED for recovery")
+            return False
 
     def _maybe_run_watchdog(self, c: SimpleNamespace, now: datetime | None = None) -> None:
         """Throttled re-assertion of protective stops on the live book.
@@ -315,7 +316,13 @@ class TradingBot:
                 and now - self._last_watchdog < timedelta(minutes=interval)):
             return
         self._last_watchdog = now
-        self._apply_startup_stops(c)
+        # Never let a recovery error escape into the bar/stream loop — a raise here
+        # would silently tear down the live stream. Log and carry on; the next
+        # watchdog tick retries.
+        try:
+            self._apply_startup_stops(c)
+        except Exception:
+            logger.exception("Stop watchdog run failed — will retry next interval")
 
     def _apply_startup_stops(self, c: SimpleNamespace) -> None:
         """Guarantee open positions stay protected, in both run modes: recover any

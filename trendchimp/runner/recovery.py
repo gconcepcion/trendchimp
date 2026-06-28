@@ -22,6 +22,22 @@ logger = logging.getLogger(__name__)
 audit = logging.getLogger("trendchimp.audit")
 
 
+def _escalate_recovery_failure(
+    symbol: str, side: "OrderSide", qty: int, *,
+    audit_code: str, message: str, reason: str,
+    safety: "SafetyController | None", stop_price=None,
+) -> None:
+    """Single chokepoint for a recovery path that left a position unprotected:
+    audit error + CRITICAL log + drive the SafetyController (alert + halt)."""
+    extra = {"symbol": symbol, "side": side.value, "qty": str(qty)}
+    if stop_price is not None:
+        extra["stop_price"] = str(stop_price)
+    audit.error(audit_code, extra=extra)
+    logger.critical(message)
+    if safety is not None:
+        safety.position_unprotected(symbol, side, qty, reason=reason)
+
+
 def recover_protective_stops(
     order_manager: "OrderManager",
     portfolio: "PortfolioState",
@@ -98,15 +114,12 @@ def recover_protective_stops(
                 recovered += 1
             else:
                 failed += 1
-                audit.error("STOP_RECOVERY_FAILED", extra={
-                    "symbol": symbol, "side": stop_side.value,
-                    "qty": str(qty), "stop_price": str(stop_price),
-                })
-                logger.critical(
-                    "Stop recovery FAILED for %s (market closed) — position is unprotected "
-                    "(%d shares, stop %s). Place a stop manually.", symbol, qty, stop_price)
-                if safety is not None:
-                    safety.position_unprotected(symbol, stop_side, qty, reason="stop_recovery_failed_closed")
+                _escalate_recovery_failure(
+                    symbol, stop_side, qty, audit_code="STOP_RECOVERY_FAILED",
+                    message=(f"Stop recovery FAILED for {symbol} (market closed) — position is "
+                             f"unprotected ({qty} shares, stop {stop_price}). Place a stop manually."),
+                    reason="stop_recovery_failed_closed", safety=safety, stop_price=stop_price,
+                )
             continue
 
         if breached:
@@ -117,15 +130,12 @@ def recover_protective_stops(
                 # unprotected, and still open. Surface it loudly rather than
                 # silently counting it as flattened.
                 failed += 1
-                audit.error("FLATTEN_ON_RECOVERY_FAILED", extra={
-                    "symbol": symbol, "side": stop_side.value, "qty": str(qty),
-                })
-                logger.critical(
-                    "Emergency flatten FAILED for %s — breached position is unprotected "
-                    "and still open (%d shares). Flatten manually now.", symbol, qty,
+                _escalate_recovery_failure(
+                    symbol, stop_side, qty, audit_code="FLATTEN_ON_RECOVERY_FAILED",
+                    message=(f"Emergency flatten FAILED for {symbol} — breached position is "
+                             f"unprotected and still open ({qty} shares). Flatten manually now."),
+                    reason="flatten_failed", safety=safety,
                 )
-                if safety is not None:
-                    safety.position_unprotected(symbol, stop_side, qty, reason="flatten_failed")
             continue
 
         if order_manager.place_protective_stop(symbol, stop_side, qty, stop_price) is not None or dry_run:
@@ -135,16 +145,12 @@ def recover_protective_stops(
             # position is live and UNPROTECTED — surface it loudly rather than
             # letting the bot trade on with a silent gap.
             failed += 1
-            audit.error("STOP_RECOVERY_FAILED", extra={
-                "symbol": symbol, "side": stop_side.value,
-                "qty": str(qty), "stop_price": str(stop_price),
-            })
-            logger.critical(
-                "Stop recovery FAILED for %s — position is unprotected (%d shares, stop %s). "
-                "Place a stop manually or restart.", symbol, qty, stop_price,
+            _escalate_recovery_failure(
+                symbol, stop_side, qty, audit_code="STOP_RECOVERY_FAILED",
+                message=(f"Stop recovery FAILED for {symbol} — position is unprotected "
+                         f"({qty} shares, stop {stop_price}). Place a stop manually or restart."),
+                reason="stop_recovery_failed", safety=safety, stop_price=stop_price,
             )
-            if safety is not None:
-                safety.position_unprotected(symbol, stop_side, qty, reason="stop_recovery_failed")
 
     log = logger.error if failed else logger.info
     log("Stop recovery complete: %d recovered, %d flattened, %d already protected, %d FAILED",

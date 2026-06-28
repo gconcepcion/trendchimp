@@ -200,6 +200,9 @@ class OrderManager:
         for managed in self.get_active_orders():
             if managed.is_stop_order:
                 continue
+            # Leave pending exits to fill — they flatten the book on the way down.
+            if managed.intent is not None and managed.intent.is_exit:
+                continue
             try:
                 self._client.cancel_order(managed.order_id)
                 managed.status = "canceled"
@@ -392,9 +395,20 @@ class OrderManager:
         # Opposite side of the entry: long entry -> SELL stop below; short -> BUY stop above.
         stop_side = OrderSide.SELL if entry.intent == TradeIntent.ENTER_LONG else OrderSide.BUY
 
-        # Idempotency: the OTO bracket (or a prior pass) may already hold the stop.
-        # Submitting a second one would leave a naked reverse position once one fills.
-        if self.has_protective_stop(entry.symbol, stop_side, qty_whole):
+        # The OTO bracket (or a prior pass) usually already holds the stop. If local
+        # state shows a gap, refresh from the broker first so an OTO child leg that
+        # wasn't in the submit response is picked up rather than duplicated — a
+        # duplicate stop would go naked-reverse once one fills.
+        if self.open_stop_qty(entry.symbol, stop_side) < qty_whole:
+            try:
+                self.reconcile()
+            except Exception:
+                logger.exception("Reconcile before fallback stop failed for %s", entry.symbol)
+
+        # Only top up the *uncovered* remainder, never the full fill (which would
+        # over-stop a partially protected position).
+        uncovered = qty_whole - self.open_stop_qty(entry.symbol, stop_side)
+        if uncovered < 1:
             logger.info("Protective stop already resting for %s — fill verified", entry.symbol)
             entry.entry_price = entry.filled_avg_price
             return
@@ -403,7 +417,7 @@ class OrderManager:
         alpaca_side = AlpacaSide.SELL if stop_side == OrderSide.SELL else AlpacaSide.BUY
         request = StopOrderRequest(
             symbol=entry.symbol,
-            qty=qty_whole,
+            qty=uncovered,
             side=alpaca_side,
             stop_price=float(stop_price),
             time_in_force=TimeInForce.GTC,
@@ -412,7 +426,7 @@ class OrderManager:
             raw = self._client.submit_order(request)
         except Exception:
             logger.exception("Failed to submit fallback protective stop for %s", entry.symbol)
-            self._escalate_unprotected(entry.symbol, stop_side, qty_whole,
+            self._escalate_unprotected(entry.symbol, stop_side, uncovered,
                                        stop_price=stop_price, reason="stop_attach_failed")
             return
 
@@ -420,7 +434,7 @@ class OrderManager:
             order_id=str(raw.id),
             symbol=entry.symbol,
             side=stop_side,
-            qty=Decimal(str(qty_whole)),
+            qty=Decimal(str(uncovered)),
             status=_enum_str(raw.status),
             submitted_at=datetime.now(tz=timezone.utc),
             strategy_name=entry.strategy_name,
