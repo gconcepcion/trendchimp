@@ -12,6 +12,7 @@ if TYPE_CHECKING:
     from trendchimp.config.settings import RiskSettings
     from trendchimp.portfolio.state import PortfolioState
     from trendchimp.risk.killswitch import KillSwitch
+    from trendchimp.safety import SafetyController
 
 logger = logging.getLogger(__name__)
 
@@ -24,10 +25,12 @@ class RiskManager:
         settings: "RiskSettings",
         sizer: TurtleUnitSizer,
         killswitch: "KillSwitch | None" = None,
+        safety: "SafetyController | None" = None,
     ) -> None:
         self._settings = settings
         self._sizer = sizer
         self._killswitch = killswitch
+        self._safety = safety
 
     def evaluate(self, signal: Signal, portfolio: "PortfolioState") -> OrderDecision | None:
         account = portfolio.get_account()
@@ -44,6 +47,12 @@ class RiskManager:
         if self._killswitch is not None and self._killswitch.check(portfolio):
             logger.warning("Kill-switch tripped (%s) — blocking entry for %s",
                            self._killswitch.reason, signal.symbol)
+            return None
+
+        # Fail-safe latch: if a position couldn't be protected, do not open new risk.
+        if self._safety is not None and self._safety.halt_entries:
+            logger.warning("Entries halted (%s) — blocking entry for %s",
+                           self._safety.halt_reason, signal.symbol)
             return None
 
         if signal.intent == TradeIntent.ENTER_SHORT and not self._settings.allow_short:
@@ -66,7 +75,10 @@ class RiskManager:
             logger.warning("Entry signal for %s missing entry_price/atr metadata", signal.symbol)
             return None
 
-        qty = self._sizer.size(entry_price, n, account.equity, account.buying_power)
+        qty = self._sizer.size(
+            entry_price, n, account.equity, account.buying_power,
+            portfolio.get_gross_exposure(),
+        )
         if qty < 1:
             logger.debug("Computed qty<1 for %s — skipping", signal.symbol)
             return None

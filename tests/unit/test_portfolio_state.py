@@ -48,6 +48,15 @@ async def test_partial_reduce_keeps_entry_price(portfolio_state):
     assert portfolio_state.get_daily_pnl() == Decimal("80")
 
 
+async def test_gross_exposure_sums_longs_and_abs_shorts_at_marks(portfolio_state):
+    await portfolio_state.on_fill(make_trade_update(symbol="AAPL", side="buy", qty="10", price="100"))
+    await portfolio_state.on_fill(make_trade_update(symbol="TSLA", side="sell", qty="5", price="200"))
+    # Mark moves: long at 110, short at 180. Gross = |10|*110 + |-5|*180 = 2000.
+    portfolio_state.update_mark("AAPL", 110)
+    portfolio_state.update_mark("TSLA", 180)
+    assert portfolio_state.get_gross_exposure() == Decimal("2000")
+
+
 async def test_peak_equity_only_rises(portfolio_state):
     await portfolio_state.on_fill(make_trade_update(side="buy", qty="100", price="100"))
     portfolio_state.update_mark("AAPL", 110)  # +$1000

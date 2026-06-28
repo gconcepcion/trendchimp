@@ -139,6 +139,15 @@ class PortfolioState:
             total += (mark - pos.avg_entry_price) * pos.qty
         return total
 
+    def get_gross_exposure(self) -> Decimal:
+        """Total open notional (longs + |shorts|) valued at last-seen marks, entry
+        price otherwise. Drives the aggregate exposure cap in sizing."""
+        total = Decimal("0")
+        for pos in self._positions.values():
+            mark = self._marks.get(pos.symbol.upper(), pos.avg_entry_price)
+            total += abs(pos.qty) * mark
+        return total
+
     def get_daily_pnl(self) -> Decimal:
         return self._realized_pnl_today + self.get_unrealized_pnl()
 
