@@ -67,6 +67,125 @@ async def test_short_entry_fill_attaches_buy_stop(mock_trading_client, portfolio
     assert stop_req.stop_price == 104.0
 
 
+def test_submit_with_bracket_builds_oto_stop(mock_trading_client, portfolio_state):
+    """Entries submitted with attach_stop_bracket carry a server-side OTO stop so the
+    position is protected atomically on fill — no fill→stop gap."""
+    from alpaca.trading.enums import OrderClass
+
+    mgr = _manager(mock_trading_client, portfolio_state)
+    mgr.submit(OrderDecision("AAPL", OrderSide.BUY, 10, TradeIntent.ENTER_LONG,
+                             Decimal("96")), attach_stop_bracket=True)
+    req = _last_request(mock_trading_client)
+    assert isinstance(req, MarketOrderRequest)
+    assert req.order_class == OrderClass.OTO
+    assert req.stop_loss.stop_price == 96.0
+
+
+def test_oto_bracket_leg_tracked_as_resting_stop(mock_trading_client, portfolio_state):
+    """The OTO child stop leg is tracked at submit time (status 'held' until the entry
+    fills) so the fill-time path sees it and never adds a duplicate stop."""
+    leg = MagicMock()
+    leg.id, leg.symbol, leg.side, leg.type = "leg-1", "AAPL", "sell", "stop"
+    leg.status, leg.qty, leg.stop_price, leg.submitted_at = "held", "10", "96", None
+    parent = MagicMock()
+    parent.id, parent.status, parent.legs = "par-1", "new", [leg]
+    mock_trading_client.submit_order.side_effect = lambda _req: parent
+
+    mgr = _manager(mock_trading_client, portfolio_state)
+    mgr.submit(OrderDecision("AAPL", OrderSide.BUY, 10, TradeIntent.ENTER_LONG,
+                             Decimal("96")), attach_stop_bracket=True)
+    assert mgr.has_protective_stop("AAPL", OrderSide.SELL, 10) is True
+
+
+async def test_fill_skips_duplicate_stop_when_already_protected(mock_trading_client, portfolio_state):
+    """With an OTO bracket the broker already holds the stop. The fill-time path must
+    be idempotent: if a protective stop already covers the position, don't submit a
+    second one (a duplicate stop becomes a naked reverse position once one fills)."""
+    mgr = _manager(mock_trading_client, portfolio_state)
+    entry = mgr.submit(OrderDecision("AAPL", OrderSide.BUY, 10,
+                                     TradeIntent.ENTER_LONG, Decimal("96")))
+    # Simulate the OTO child stop already resting at the broker.
+    mgr.place_protective_stop("AAPL", OrderSide.SELL, 10, Decimal("96"))
+    calls_before = mock_trading_client.submit_order.call_count
+
+    await mgr.handle_trade_update(make_trade_update(order_id=entry.order_id, side="buy",
+                                                    qty="10", price="100", status="filled"))
+
+    assert mock_trading_client.submit_order.call_count == calls_before
+
+
+async def test_fill_fallback_sizes_to_uncovered_remainder(mock_trading_client, portfolio_state):
+    """If only part of the position is already covered, the fill-time fallback must
+    place a stop for the UNCOVERED remainder, not the full qty (which would over-stop
+    and leave a naked reverse position once one stop fills)."""
+    mgr = _manager(mock_trading_client, portfolio_state)
+    entry = mgr.submit(OrderDecision("AAPL", OrderSide.BUY, 10,
+                                     TradeIntent.ENTER_LONG, Decimal("96")))
+    # A partial 4-share protective stop already rests.
+    mgr.place_protective_stop("AAPL", OrderSide.SELL, 4, Decimal("96"))
+
+    await mgr.handle_trade_update(make_trade_update(order_id=entry.order_id, side="buy",
+                                                    qty="10", price="100", status="filled"))
+    stop_req = _last_request(mock_trading_client)
+    assert isinstance(stop_req, StopOrderRequest)
+    assert stop_req.qty == 6  # 10 filled - 4 already covered
+
+
+async def test_fill_reconciles_before_fallback_to_avoid_duplicate(mock_trading_client, portfolio_state):
+    """If the OTO child stop rests at the broker but wasn't tracked locally (omitted
+    from the submit response), the fill path must reconcile and find it rather than
+    placing a duplicate full-size stop."""
+    from unittest.mock import MagicMock
+
+    mgr = _manager(mock_trading_client, portfolio_state)
+    entry = mgr.submit(OrderDecision("AAPL", OrderSide.BUY, 10,
+                                     TradeIntent.ENTER_LONG, Decimal("96")))
+    # Broker reports the resting OTO stop only on reconcile (not tracked at submit).
+    broker_stop = MagicMock()
+    broker_stop.id, broker_stop.symbol, broker_stop.side = "oto-stop", "AAPL", "sell"
+    broker_stop.type, broker_stop.status, broker_stop.qty = "stop", "held", "10"
+    broker_stop.stop_price, broker_stop.submitted_at = "96", None
+    mock_trading_client.get_open_orders.return_value = [broker_stop]
+    calls_before = mock_trading_client.submit_order.call_count
+
+    await mgr.handle_trade_update(make_trade_update(order_id=entry.order_id, side="buy",
+                                                    qty="10", price="100", status="filled"))
+    assert mock_trading_client.submit_order.call_count == calls_before  # no duplicate
+
+
+async def test_fill_escalates_when_fallback_stop_fails(mock_trading_client, portfolio_state, caplog):
+    """If a fill arrives with no resting stop and the fallback stop submission fails,
+    the position is naked — escalate loudly rather than swallowing the error."""
+    import logging
+
+    mgr = _manager(mock_trading_client, portfolio_state)
+    entry = mgr.submit(OrderDecision("AAPL", OrderSide.BUY, 10,
+                                     TradeIntent.ENTER_LONG, Decimal("96")))
+    # Make every subsequent submission (the protective stop) fail.
+    mock_trading_client.submit_order.side_effect = RuntimeError("rejected")
+
+    with caplog.at_level(logging.CRITICAL):
+        await mgr.handle_trade_update(make_trade_update(order_id=entry.order_id, side="buy",
+                                                        qty="10", price="100", status="filled"))
+    assert any("unprotected" in r.message.lower() for r in caplog.records)
+
+
+async def test_fill_failure_triggers_safety_halt(mock_trading_client, portfolio_state):
+    """A naked-position escalation must drive the shared SafetyController (halt new
+    entries + alert), not just log."""
+    from trendchimp.safety import SafetyController
+
+    safety = SafetyController(halt_on_unprotected=True)
+    mgr = OrderManager(mock_trading_client, portfolio_state, dry_run=False, safety=safety)
+    entry = mgr.submit(OrderDecision("AAPL", OrderSide.BUY, 10,
+                                     TradeIntent.ENTER_LONG, Decimal("96")))
+    mock_trading_client.submit_order.side_effect = RuntimeError("rejected")
+
+    await mgr.handle_trade_update(make_trade_update(order_id=entry.order_id, side="buy",
+                                                    qty="10", price="100", status="filled"))
+    assert safety.halt_entries is True
+
+
 async def test_exit_fill_cancels_open_stop(mock_trading_client, portfolio_state):
     mgr = _manager(mock_trading_client, portfolio_state)
     # Enter long and fill -> stop order created (ord-2).
@@ -133,6 +252,35 @@ def test_reconciled_open_order_reads_as_open(mock_trading_client, portfolio_stat
     mgr.reconcile()
 
     assert mgr.has_protective_stop("AAPL", OrderSide.SELL, 10) is True
+
+
+def test_cancel_open_entries_leaves_protective_stops(mock_trading_client, portfolio_state):
+    """On a kill-switch shutdown the bot must cancel pending entry orders but never
+    the resting protective stops — cancelling those would leave the book naked while
+    the bot is offline."""
+    mgr = _manager(mock_trading_client, portfolio_state)
+    entry = mgr.submit(OrderDecision("AAPL", OrderSide.BUY, 10,
+                                     TradeIntent.ENTER_LONG, Decimal("96")))
+    # A resting GTC protective stop on the same symbol.
+    mgr.place_protective_stop("AAPL", OrderSide.SELL, 10, Decimal("96"))
+
+    mgr.cancel_open_entries()
+
+    # Only the entry is cancelled; the protective stop is left untouched.
+    mock_trading_client.cancel_order.assert_called_once_with(entry.order_id)
+
+
+def test_cancel_open_entries_leaves_exit_orders(mock_trading_client, portfolio_state):
+    """On shutdown, pending EXIT orders should be left to fill (they flatten the book),
+    not cancelled along with entries."""
+    mgr = _manager(mock_trading_client, portfolio_state)
+    entry = mgr.submit(OrderDecision("AAPL", OrderSide.BUY, 10,
+                                     TradeIntent.ENTER_LONG, Decimal("96")))
+    mgr.submit(OrderDecision("AAPL", OrderSide.SELL, 10, TradeIntent.EXIT_LONG, None))
+
+    mgr.cancel_open_entries()
+    # Only the entry is cancelled; the pending exit is left to fill.
+    mock_trading_client.cancel_order.assert_called_once_with(entry.order_id)
 
 
 def test_dry_run_submits_nothing(mock_trading_client, portfolio_state):

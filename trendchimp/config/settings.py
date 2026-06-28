@@ -43,6 +43,7 @@ class RiskSettings(BaseSettings):
     daily_loss_limit_pct: float = 0.02  # kill-switch: halt if daily P&L <= -2% of equity
     max_drawdown_pct: float = 0.20      # kill-switch: halt if peak-to-now drawdown >= 20%
     max_position_pct: float = 0.20      # hard cap on any single unit's notional vs equity
+    max_gross_exposure_pct: float = 1.0  # cap total open notional vs equity (1.0 = no margin)
     allow_short: bool = True
     # Startup stop-recovery: stop distance used only when ATR can't be computed.
     recovery_fallback_stop_pct: float = 0.10
@@ -51,6 +52,10 @@ class RiskSettings(BaseSettings):
     # below is only a fallback for when ATR can't be computed (too little history).
     orphan_trailing_atr_mult: float = 2.0
     orphan_trailing_stop_pct: float = 0.05
+    # Live-mode watchdog: re-assert protective stops on the running book at most this
+    # often (minutes) so a stop cancelled/rejected mid-session is repaired without a
+    # restart. 0 disables the watchdog (startup recovery still runs).
+    stop_watchdog_minutes: int = 15
 
 
 class ScreenerSettings(BaseSettings):
@@ -62,6 +67,31 @@ class ScreenerSettings(BaseSettings):
     final_picks: int = 10            # tickers Claude selects for the universe
     lookback_days: int = 260         # daily bars fetched per symbol (SMA200 + buffer)
     cache_dir: str = "./cache"       # where the S&P 500 list is cached
+    # Price band for candidates (0 = no limit). Set max_price for small accounts so
+    # whole-share sizing can still take positions (a $1-2K account can't afford a
+    # share of a $300+ stock within the 20% position cap).
+    min_price: float = 0.0
+    max_price: float = 0.0
+
+
+class AlertSettings(BaseSettings):
+    """Email/SMTP alerting for safety-critical events (unprotected positions,
+    kill-switch trips). Disabled by default; a no-op notifier is used until both an
+    SMTP host and at least one recipient are configured."""
+
+    model_config = SettingsConfigDict(extra="ignore")
+
+    enabled: bool = False
+    smtp_host: str = ""
+    smtp_port: int = 587
+    smtp_username: str = ""
+    smtp_password: str = ""
+    use_tls: bool = True
+    email_from: str = ""
+    email_to: str = ""  # comma-separated recipients
+    # Fail-safe policy: when a position genuinely can't be protected, halt all new
+    # entries (keep the position, alert) until the bot is restarted / cleared.
+    halt_entries_on_unprotected: bool = True
 
 
 class LoggingSettings(BaseSettings):
@@ -86,6 +116,7 @@ class TrendChimpSettings(BaseSettings):
     strategy: StrategySettings = StrategySettings()
     risk: RiskSettings = RiskSettings()
     screener: ScreenerSettings = ScreenerSettings()
+    alerts: AlertSettings = AlertSettings()
     logging: LoggingSettings = LoggingSettings()
 
     # Must be set explicitly to enable live trading alongside paper=False

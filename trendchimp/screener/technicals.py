@@ -88,6 +88,8 @@ class TrendScorer:
         market_data: "MarketDataClient",
         lookback_days: int = 260,
         top_n: int = 30,
+        min_price: float = 0.0,
+        max_price: float = 0.0,
     ) -> list[BreakoutCandidate]:
         end = datetime.now(tz=timezone.utc)
         # Generous calendar window to cover `lookback_days` trading days.
@@ -102,7 +104,7 @@ class TrendScorer:
                 logger.exception("Batch fetch failed for %s — skipping", batch[:3])
                 continue
             for symbol, df in frames.items():
-                cand = self._score_one(symbol, df)
+                cand = self._score_one(symbol, df, min_price=min_price, max_price=max_price)
                 if cand is not None:
                     candidates.append(cand)
 
@@ -110,7 +112,9 @@ class TrendScorer:
         logger.info("Scored %d symbols, returning top %d", len(candidates), top_n)
         return candidates[:top_n]
 
-    def _score_one(self, symbol: str, df) -> BreakoutCandidate | None:
+    def _score_one(
+        self, symbol: str, df, min_price: float = 0.0, max_price: float = 0.0,
+    ) -> BreakoutCandidate | None:
         if df is None or len(df) < _MIN_BARS:
             return None
         close = df["close"].to_numpy(dtype=float)
@@ -120,6 +124,12 @@ class TrendScorer:
 
         price = float(close[-1])
         if price <= 0:
+            return None
+        # Optional price band (0 = no limit) so a small account can build a universe
+        # of names it can actually size into under whole-share + position-cap rules.
+        if min_price and price < min_price:
+            return None
+        if max_price and price > max_price:
             return None
 
         sma50 = float(close[-50:].mean())

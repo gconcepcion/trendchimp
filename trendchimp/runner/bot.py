@@ -32,6 +32,7 @@ class TradingBot:
     def __init__(self, settings: "TrendChimpSettings") -> None:
         self._settings = settings
         self._running = False
+        self._last_watchdog: datetime | None = None
 
     # ----------------------------------------------------------------- live mode
     def start(self) -> None:
@@ -61,9 +62,19 @@ class TradingBot:
             # protective stops see live prices; the strategy itself only acts on
             # completed daily bars emitted by the aggregator.
             c.portfolio.update_mark(bar.symbol, bar.close)
+            # Periodically re-assert protection on the running book so a stop that
+            # disappears mid-session (cancelled/rejected/expired) is repaired without
+            # waiting for a restart.
+            self._maybe_run_watchdog(c)
             if c.killswitch.check(c.portfolio):
                 logger.error("Kill-switch tripped (%s) — initiating shutdown",
                              c.killswitch.reason)
+                c.safety.notify(
+                    subject=f"[trendchimp] KILL-SWITCH tripped: {c.killswitch.reason}",
+                    body=(f"The kill-switch tripped ({c.killswitch.reason}). The bot is "
+                          f"shutting down; pending entry orders are cancelled and "
+                          f"protective stops are left resting at the broker."),
+                )
                 stop_event.set()
                 return
             daily = aggregator.add(bar)
@@ -72,7 +83,11 @@ class TradingBot:
             for sig in await c.strategy.on_bar(daily):
                 decision = c.risk_manager.evaluate(sig, c.portfolio)
                 if decision:
-                    c.order_manager.submit(decision)
+                    # Attach the protective stop server-side (OTO) so the position is
+                    # protected atomically on fill — never a fill→stop gap, even if the
+                    # bot loses the stream the instant the entry fills. The fill
+                    # listener still verifies and backfills a stop if one is missing.
+                    c.order_manager.submit(decision, attach_stop_bracket=True)
 
         for symbol in c.symbols:
             feed.subscribe(symbol, DataType.BAR, _on_bar)
@@ -81,6 +96,9 @@ class TradingBot:
             feed=feed, settings=self._settings,
             stock_stream=stock_stream, trading_stream=trading_stream,
             symbols=c.symbols,
+            # On any stream reconnect, re-assert protection: a gap could have hidden a
+            # fill whose stop never attached.
+            on_reconnect=lambda: self._apply_startup_stops(c),
         )
         stream_manager.add_trade_update_handler(c.order_manager.handle_trade_update)
 
@@ -102,8 +120,9 @@ class TradingBot:
         finally:
             logger.info("Shutting down...")
             if c.killswitch.tripped and not self._settings.trading.dry_run:
-                # Cancel pending entry orders but leave protective stops in place.
-                c.order_manager.cancel_all()
+                # Cancel pending entry orders but leave protective stops resting at
+                # the broker — the book must stay protected while the bot is offline.
+                c.order_manager.cancel_open_entries()
             await stream_manager.stop()
             self._running = False
             logger.info("trendchimp stopped")
@@ -208,11 +227,13 @@ class TradingBot:
         from trendchimp.clients.market_data import MarketDataClient
         from trendchimp.clients.trading import TradingClientWrapper
         from trendchimp.logging.setup import configure_logging
+        from trendchimp.notify import build_notifier
         from trendchimp.orders.manager import OrderManager
         from trendchimp.portfolio.state import PortfolioState
         from trendchimp.risk.killswitch import KillSwitch
         from trendchimp.risk.manager import RiskManager
         from trendchimp.risk.sizing import TurtleUnitSizer
+        from trendchimp.safety import SafetyController
         from trendchimp.strategies.registry import StrategyRegistry
 
         import trendchimp.strategies.donchian  # noqa: F401  (register strategy)
@@ -231,10 +252,17 @@ class TradingBot:
         portfolio = PortfolioState()
         portfolio.reconcile(trading_client)
 
+        notifier = build_notifier(self._settings.alerts)
+        safety = SafetyController(
+            notifier=notifier,
+            halt_on_unprotected=self._settings.alerts.halt_entries_on_unprotected,
+        )
+
         order_manager = OrderManager(
             trading_client=trading_client,
             portfolio_state=portfolio,
             dry_run=self._settings.trading.dry_run,
+            safety=safety,
         )
         order_manager.reconcile()
 
@@ -242,12 +270,13 @@ class TradingBot:
             risk_per_trade_pct=self._settings.risk.risk_per_trade_pct,
             atr_stop_mult=self._settings.risk.atr_stop_mult,
             max_position_pct=self._settings.risk.max_position_pct,
+            max_gross_exposure_pct=self._settings.risk.max_gross_exposure_pct,
         )
         killswitch = KillSwitch(
             daily_loss_limit_pct=self._settings.risk.daily_loss_limit_pct,
             max_drawdown_pct=self._settings.risk.max_drawdown_pct,
         )
-        risk_manager = RiskManager(self._settings.risk, sizer, killswitch)
+        risk_manager = RiskManager(self._settings.risk, sizer, killswitch, safety=safety)
 
         strategy = StrategyRegistry.get(
             self._settings.strategy.name, params=self._settings.strategy.params,
@@ -259,7 +288,41 @@ class TradingBot:
             factory=factory, trading_client=trading_client, market_data=market_data,
             portfolio=portfolio, order_manager=order_manager, killswitch=killswitch,
             risk_manager=risk_manager, strategy=strategy, symbols=symbols,
+            safety=safety,
         )
+
+    @staticmethod
+    def _is_market_open(c: SimpleNamespace) -> bool:
+        """Best-effort market-open check for recovery decisions. Fails CLOSED on any
+        error: a breached position then rests a protective stop (which resolves at the
+        open) instead of firing a DAY market flatten the broker would reject."""
+        try:
+            return bool(c.trading_client.get_clock().is_open)
+        except Exception:
+            logger.warning("Could not read market clock — assuming market CLOSED for recovery")
+            return False
+
+    def _maybe_run_watchdog(self, c: SimpleNamespace, now: datetime | None = None) -> None:
+        """Throttled re-assertion of protective stops on the live book.
+
+        Runs ``_apply_startup_stops`` (idempotent: recover missing stops, hand off
+        orphans) at most once per ``stop_watchdog_minutes``. A value of 0 disables it.
+        """
+        interval = self._settings.risk.stop_watchdog_minutes
+        if interval <= 0:
+            return
+        now = now or datetime.now(tz=timezone.utc)
+        if (self._last_watchdog is not None
+                and now - self._last_watchdog < timedelta(minutes=interval)):
+            return
+        self._last_watchdog = now
+        # Never let a recovery error escape into the bar/stream loop — a raise here
+        # would silently tear down the live stream. Log and carry on; the next
+        # watchdog tick retries.
+        try:
+            self._apply_startup_stops(c)
+        except Exception:
+            logger.exception("Stop watchdog run failed — will retry next interval")
 
     def _apply_startup_stops(self, c: SimpleNamespace) -> None:
         """Guarantee open positions stay protected, in both run modes: recover any
@@ -271,7 +334,8 @@ class TradingBot:
         )
         recover_protective_stops(
             c.order_manager, c.portfolio, c.market_data, self._settings,
-            dry_run=self._settings.trading.dry_run,
+            dry_run=self._settings.trading.dry_run, safety=c.safety,
+            market_open=self._is_market_open(c),
         )
         convert_orphans_to_trailing_stops(
             c.order_manager, c.portfolio, set(c.symbols), c.market_data, self._settings,
